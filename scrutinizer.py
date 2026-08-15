@@ -9,16 +9,18 @@ survive composite output, so pygame here only builds surfaces/fonts, the
 framebuffer is written to directly, and the keyboard is read via evdev
 instead of through SDL).
 
-This single process owns two *screens* -- the health dashboard and the
-app-selector list (formerly a separate `menu.py` process) -- switched
-between via `self.screen`, not by launching a child process. They used
-to be two separate programs handing the console back and forth via
+This single process owns the health dashboard and the app-selector list
+(formerly a separate `menu.py` process, then a separate `self.screen`
+mode, now just page index MENU_PAGE_INDEX of `self.current_page` as of
+the 2026-08-15 McBrain navigation redesign -- see PAGE_COUNT/
+MENU_PAGE_INDEX). Nothing here launches a child process to switch pages;
+that's a holdover concern from when the dashboard and app-selector were
+two separate programs handing the console back and forth via
 subprocess.run(), which meant a visible pause and text-console flash on
 every switch (process startup, font reloading, KD_TEXT/KD_GRAPHICS
-transitions); merging them means switching is just a state change and a
-redraw, with the framebuffer/console/evdev session held open the whole
-time. Only the real apps (bars/loudness/channel38/weatherstar) still get
-launched as actual subprocesses via launch_app() -- see that method.
+transitions). Only the real apps (bars/loudness/channel38/weatherstar)
+still get launched as actual subprocesses via launch_app() -- see that
+method -- or assigned to a remote puppet via assign_to_puppet().
 
 Font: body text uses VCR_OSD_MONO_1.001.ttf (same font as bars/loudness/
 channel38, switched 2026-08-14 for legibility -- was Px437_IBM_VGA_9x16.ttf).
@@ -91,6 +93,16 @@ PUPPETS = [
 ]
 MONITOR_TARGETS = ["LOCAL"] + [name for name, _ip in PUPPETS]
 PUPPET_PORT = 8420
+
+# The app menu is a 3rd page (index 2) of the same health screen, not a
+# separate "screen" mode -- Up/Down means "switch monitored machine" on
+# the gauge pages (0/1) and "move the menu cursor" on the menu page,
+# Left/Right always means "change page" regardless of which one you're
+# on. Selecting an app on the menu page acts on whichever machine is
+# currently selected (self.monitor_target): launches locally for LOCAL,
+# assigns remotely via STRINGS for a puppet. 2026-08-15 redesign.
+MENU_PAGE_INDEX = 2
+PAGE_COUNT = 3
 PUPPET_POLL_TIMEOUT_SECONDS = 2
 PUPPET_POLL_INTERVAL_SECONDS = 3
 
@@ -774,10 +786,11 @@ class HealthApp:
         self.osd_font = pygame.font.Font(str(FONT_PATH), 32)
         self.option_font = pygame.font.Font(str(FONT_PATH), 28)
 
-        # "health" or "menu" -- which screen is currently showing. Switching
-        # between them is just this flag + a redraw (see handle_keycode()),
-        # not a process launch -- see the module docstring for why.
-        self.screen = "health"
+        # No more separate "screen" concept -- the app menu is just page
+        # index MENU_PAGE_INDEX of self.current_page now (2026-08-15
+        # redesign). Switching pages is just updating that int + a
+        # redraw (see handle_keycode()), not a process launch -- see the
+        # module docstring for why.
 
         # Health-dashboard panel layout. Panel columns/rows are computed
         # from the display's actual usable grid (not hardcoded) so the
@@ -892,10 +905,7 @@ class HealthApp:
 
     def render(self):
         canvas = pygame.Surface((FRAME_W, FRAME_H))
-        if self.screen == "health":
-            self.build_health_canvas(canvas)
-        else:
-            self.build_menu_canvas(canvas)
+        self.build_health_canvas(canvas)  # dispatches to the menu page internally for MENU_PAGE_INDEX
         if self.power_dialog_active:
             self.draw_power_dialog(canvas)
         self.fb.write_surface(canvas)
@@ -917,6 +927,10 @@ class HealthApp:
         return [panels[0], panels[1], app_panel]
 
     def build_health_canvas(self, canvas):
+        if self.current_page == MENU_PAGE_INDEX:
+            self._build_menu_page(canvas)
+            return
+
         if self.monitor_target == "LOCAL":
             stats, offline = self.poller.stats, False
             target_label = self.hostname
@@ -935,18 +949,34 @@ class HealthApp:
         else:
             self.display.render_page(canvas, panels, stats)
 
-        headline = f"{target_label} - PAGE {self.current_page + 1}/{len(self.pages)}"
+        headline = f"{target_label} - PAGE {self.current_page + 1}/{PAGE_COUNT}"
         headline_surf = self.display._label_font.render(headline, True, ORANGE)
         row0_y = self.display.char_px(0, 0)[1]
         canvas.blit(headline_surf, ((FRAME_W - headline_surf.get_width()) // 2, row0_y))
 
-    def build_menu_canvas(self, canvas):
+    def _build_menu_page(self, canvas):
+        """Page MENU_PAGE_INDEX -- selecting a row here acts on whichever
+        machine self.monitor_target currently points at: launches
+        locally for LOCAL (unchanged from before the 2026-08-15
+        redesign), assigns remotely via STRINGS for a puppet (see
+        assign_to_puppet()). Hardware-readiness (HARDWARE NOT FOUND)
+        comes from that same machine -- self.hardware_status for LOCAL,
+        the puppet's own STRINGS-reported `hardware` field otherwise, so
+        it reflects what's actually attached *there*, not to MP."""
         canvas.fill(BLACK)
         d = self.display
 
+        if self.monitor_target == "LOCAL":
+            hardware_status = self.hardware_status
+            title = f"CENTRAL SCRUTINIZER {VERSION}".upper()
+        else:
+            stats, fresh = self.remote_poller.get(self.monitor_target)
+            hardware_status = (stats or {}).get("hardware") or {}
+            title = f"ASSIGN TO {self.monitor_target}{'' if fresh else ' (OFFLINE)'}".upper()
+
         box_rows = d._height  # no footer reserved below the box anymore (2026-08-14) -- box fills the full usable height
         self.display.draw_panel_frame(canvas, Panel(
-            0, 0, d._width, box_rows, f"CENTRAL SCRUTINIZER {VERSION}".upper(), subtitle="BY METAL SHOP"))
+            0, 0, d._width, box_rows, title, subtitle="BY METAL SHOP"))
 
         rows_per_app = 2  # label+version row, description row
         total_rows = rows_per_app * MENU_ITEM_COUNT
@@ -982,7 +1012,7 @@ class HealthApp:
             app_version = read_app_version(script_path)
             line = d._font.render(f"{label} {app_version}".upper(), True, text_color)
             canvas.blit(line, (px_x, px_y))
-            hw_ok = self.hardware_status.get(cmd, True)
+            hw_ok = hardware_status.get(cmd, True)
             desc_text = desc.upper() if hw_ok else "HARDWARE NOT FOUND"
             # RED on the normal black background makes the warning stand
             # out; on the selected row's orange highlight it stays BLACK
@@ -1029,11 +1059,11 @@ class HealthApp:
 
     def launch_app(self, cmd):
         """Launches one of the real apps as an actual subprocess (unlike
-        switching between the health/menu screens, these are genuinely
-        separate programs needing real console ownership). Switches to the
-        health screen if the app's Home button was pressed (it exits with
-        EXIT_GOTO_HOME to signal that) -- otherwise stays on the menu
-        screen and refreshes hardware status."""
+        switching pages, these are genuinely separate programs needing
+        real console ownership). Jumps to page 0 if the app's Home
+        button was pressed (it exits with EXIT_GOTO_HOME to signal
+        that) -- otherwise stays on the menu page and refreshes
+        hardware status."""
         self.release_console()
         result = None
         try:
@@ -1042,7 +1072,7 @@ class HealthApp:
             self.acquire_console()
             self.drain_stale_events()
         if result is not None and result.returncode == EXIT_GOTO_HOME:
-            self.screen = "health"
+            self.current_page = 0
             self.poller.refresh()
         else:
             self.refresh_hardware_status()
@@ -1085,6 +1115,53 @@ class HealthApp:
         time.sleep(2)
         self.render()
 
+    def assign_to_puppet(self, target, cmd):
+        """Remote-puppet equivalent of launch_app() -- assigns `cmd` to
+        `target` (a PUPPETS name) via its STRINGS /assign endpoint
+        instead of launching it locally. Blocks briefly for a
+        confirmation screen, same pattern as identify_puppets()."""
+        ip = dict(PUPPETS)[target]
+        ok = False
+        try:
+            req = urllib.request.Request(
+                f"http://{ip}:{PUPPET_PORT}/assign",
+                data=json.dumps({"app": cmd}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=2)
+            ok = True
+        except OSError:
+            ok = False
+
+        canvas = pygame.Surface((FRAME_W, FRAME_H))
+        canvas.fill(BLACK)
+        lines = [f"{target}: ASSIGN {cmd.upper()}", "OK" if ok else "FAILED -- UNREACHABLE"]
+        colors = [ORANGE, ORANGE if ok else RED]
+        y = self.display._margin_y
+        for line, color in zip(lines, colors):
+            surf = self.display._font.render(line, True, color)
+            canvas.blit(surf, ((FRAME_W - surf.get_width()) // 2, y))
+            y += self.display._char_h
+        self.fb.write_surface(canvas)
+
+        time.sleep(2)
+        self.render()
+
+    def _activate_menu_selection(self):
+        """Enter on the menu page -- IDENTIFY PUPPETS is always a
+        fleet-wide broadcast regardless of monitor_target, but a real
+        app row acts on whichever machine is currently selected:
+        launches locally for LOCAL, assigns remotely for a puppet."""
+        if self.selected == len(APPS):
+            self.identify_puppets()
+            return
+        cmd = APPS[self.selected][3]
+        if self.monitor_target == "LOCAL":
+            self.launch_app(cmd)
+        else:
+            self.assign_to_puppet(self.monitor_target, cmd)
+
     def handle_keycode(self, code):
         """Returns True if the app should redraw after this key."""
         if self.power_dialog_active:
@@ -1094,21 +1171,24 @@ class HealthApp:
         elif code == ecodes.KEY_POWER:
             self.power_dialog_active = True
             self.power_dialog_selection = 0
-        elif self.screen == "health":
-            return self._handle_health_keycode(code)
+        elif self.current_page == MENU_PAGE_INDEX:
+            return self._handle_menu_page_keycode(code)
         else:
-            return self._handle_menu_keycode(code)
+            return self._handle_gauge_page_keycode(code)
         return True
 
-    def _handle_health_keycode(self, code):
-        if code == ecodes.KEY_COMPOSE:  # hamburger/Menu button
-            self.screen = "menu"
+    def _handle_gauge_page_keycode(self, code):
+        """Pages 0/1 (CPU/MEM, WIFI/NET) -- Up/Down switches which
+        machine's stats are shown (LOCAL/P1-P4); pick the puppet here
+        before paging over to the menu to act on it."""
+        if code == ecodes.KEY_COMPOSE:  # hamburger/Menu button -- jump straight to the menu page
+            self.current_page = MENU_PAGE_INDEX
         elif code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME, ecodes.KEY_BACK):
-            pass  # already home -- no-op
+            self.current_page = 0  # Home always means "page 0" specifically now
         elif code == ecodes.KEY_LEFT:
-            self.current_page = (self.current_page - 1) % len(self.pages)
+            self.current_page = (self.current_page - 1) % PAGE_COUNT
         elif code == ecodes.KEY_RIGHT:
-            self.current_page = (self.current_page + 1) % len(self.pages)
+            self.current_page = (self.current_page + 1) % PAGE_COUNT
         elif code == ecodes.KEY_UP:
             idx = MONITOR_TARGETS.index(self.monitor_target)
             self.monitor_target = MONITOR_TARGETS[(idx - 1) % len(MONITOR_TARGETS)]
@@ -1119,21 +1199,27 @@ class HealthApp:
             return False
         return True
 
-    def _handle_menu_keycode(self, code):
+    def _handle_menu_page_keycode(self, code):
+        """Page MENU_PAGE_INDEX -- Up/Down here means moving the
+        selection cursor instead of switching puppets (that's done from
+        pages 0/1 before paging over here); Enter activates the
+        highlighted row against monitor_target (see
+        _activate_menu_selection)."""
         if code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME, ecodes.KEY_BACK):
-            self.screen = "health"
+            self.current_page = 0
         elif code == ecodes.KEY_COMPOSE:
-            pass  # already at the app menu -- no-op
+            pass  # already at the menu page -- no-op
+        elif code == ecodes.KEY_LEFT:
+            self.current_page = (self.current_page - 1) % PAGE_COUNT
+        elif code == ecodes.KEY_RIGHT:
+            self.current_page = (self.current_page + 1) % PAGE_COUNT
         elif code == ecodes.KEY_UP:
             self.selected = (self.selected - 1) % MENU_ITEM_COUNT
         elif code == ecodes.KEY_DOWN:
             self.selected = (self.selected + 1) % MENU_ITEM_COUNT
         elif code in (ecodes.KEY_ENTER, ecodes.KEY_KPENTER, ecodes.BTN_LEFT, ecodes.BTN_MOUSE):
-            if self.selected == len(APPS):
-                self.identify_puppets()
-            else:
-                self.launch_app(APPS[self.selected][3])
-            return False  # both already rendered
+            self._activate_menu_selection()
+            return False  # already rendered
         else:
             return False
         return True
@@ -1202,21 +1288,21 @@ class HealthApp:
                     break
 
                 now = time.time()
-                if self.screen == "health" and now - last_stats_refresh >= STATS_REFRESH_SECONDS:
+                if self.current_page != MENU_PAGE_INDEX and now - last_stats_refresh >= STATS_REFRESH_SECONDS:
                     self.poller.refresh()
                     last_stats_refresh = now
                     self.render()
-                # Screensaver: 2 minutes idle while sitting at the menu
-                # screen (not the health screen, not mid-dialog) switches
-                # back to health exactly like a Back/Home press would.
-                elif (self.screen == "menu" and not self.power_dialog_active
+                # Screensaver: 2 minutes idle while sitting on the menu
+                # page (not a gauge page, not mid-dialog) bounces back to
+                # page 0 exactly like a Back/Home press would.
+                elif (self.current_page == MENU_PAGE_INDEX and not self.power_dialog_active
                         and now - last_input_time >= IDLE_TIMEOUT_SECONDS):
-                    self.screen = "health"
+                    self.current_page = 0
                     self.poller.refresh()
                     last_input_time = now
                     self.render()
 
-                # Independent of the screen-specific branch above -- a
+                # Independent of the page-specific branch above -- a
                 # hardware/connectivity check (e.g. WEATHERSTAR's
                 # internet-reachability check) that fails once used to
                 # stay "HARDWARE NOT FOUND" forever, since the only
@@ -1224,11 +1310,11 @@ class HealthApp:
                 # launched app. Re-polling periodically means a
                 # transient blip self-heals instead of needing a
                 # restart to notice it cleared. Only re-renders on the
-                # menu screen, the only place this is ever shown.
+                # menu page, the only place this is ever shown.
                 if now - last_hw_refresh >= HARDWARE_REFRESH_SECONDS:
                     self.refresh_hardware_status()
                     last_hw_refresh = now
-                    if self.screen == "menu":
+                    if self.current_page == MENU_PAGE_INDEX:
                         self.render()
         finally:
             self.fb.close()
