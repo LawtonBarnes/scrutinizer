@@ -1,0 +1,1043 @@
+#!/usr/bin/env python3
+"""System Health Monitor + App Menu for the Metal Shop Pi.
+
+The boot-default "home" screen -- amber-CRT/MS-DOS-monitor style CPU/WiFi
+dashboard, box-drawn with the IBM VGA CP437 font. Same headless-pygame +
+direct-/dev/fb0 + evdev architecture as bars.py/loudness (see bars.py's
+module docstring for the full rationale: SDL's kmsdrm driver doesn't
+survive composite output, so pygame here only builds surfaces/fonts, the
+framebuffer is written to directly, and the keyboard is read via evdev
+instead of through SDL).
+
+This single process owns two *screens* -- the health dashboard and the
+app-selector list (formerly a separate `menu.py` process) -- switched
+between via `self.screen`, not by launching a child process. They used
+to be two separate programs handing the console back and forth via
+subprocess.run(), which meant a visible pause and text-console flash on
+every switch (process startup, font reloading, KD_TEXT/KD_GRAPHICS
+transitions); merging them means switching is just a state change and a
+redraw, with the framebuffer/console/evdev session held open the whole
+time. Only the real apps (bars/loudness/channel38/weatherstar) still get
+launched as actual subprocesses via launch_app() -- see that method.
+
+Font: body text uses VCR_OSD_MONO_1.001.ttf (same font as bars/loudness/
+channel38, switched 2026-08-14 for legibility -- was Px437_IBM_VGA_9x16.ttf).
+VCR OSD MONO has no Unicode box-drawing glyphs (checked directly: rendering
+BOX_H/BOX_V/corners with it matches a known-missing-glyph's bounding box
+exactly), so panel borders still render with Px437_IBM_VGA_9x16.ttf via a
+second, separately-sized _border_font -- see draw_panel_frame(). Both fonts
+are square-pixel ("Px"/non-aspect-corrected) variants, not aspect-corrected
+("Ac") ones -- FrameBuffer.write_surface() below already stretches this
+app's 720x480 canvas to whatever the real framebuffer resolution is (a 4:3
+target), which already performs the NTSC-style non-square-pixel correction;
+an Ac font here would double-correct. Re-check this once ever run on real
+composite/CRT output where that stretch may not happen at all.
+"""
+import fcntl
+import os
+import re
+import selectors
+import signal
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import evdev
+import psutil
+from evdev import ecodes
+
+os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+
+import pygame  # noqa: E402  (must come after SDL env vars are set)
+
+VERSION = "2.1"
+
+BASE_DIR = Path(__file__).resolve().parent
+FONT_PATH = BASE_DIR / "VCR_OSD_MONO_1.001.ttf"
+BORDER_FONT_PATH = BASE_DIR / "Px437_IBM_VGA_9x16.ttf"  # box-drawing glyphs only, VCR OSD MONO lacks them
+
+FRAME_W, FRAME_H = 720, 480
+UNDERSCAN = 0.10
+TARGET_WIDTH = 40
+
+BLACK = (0, 0, 0)
+ORANGE = (0xFF, 0xA5, 0x00)
+RED = (220, 30, 30)  # HARDWARE NOT FOUND only -- every other color is ORANGE
+
+KDSETMODE = 0x4B3A
+KD_TEXT = 0x00
+KD_GRAPHICS = 0x01
+
+STATS_REFRESH_SECONDS = 1.0  # health screen: how often to re-poll CPU/WiFi stats
+IDLE_POLL_TIMEOUT = 1.0
+IDLE_TIMEOUT_SECONDS = 120  # menu screen: screensaver, hand off to health after 2 idle minutes
+
+POWER_OPTIONS = ["NO", "YES", "RESTART"]
+MOUSE_MOVE_THRESHOLD = 12  # cumulative REL_X/REL_Y units before it counts as one direction press
+
+# The 4 real apps' Home button exits with this so launch_app() knows to
+# switch straight to the health screen instead of the menu screen once
+# the subprocess returns -- see launch_app() below.
+EXIT_GOTO_HOME = 42
+
+WIFI_IFACE = "wlan0"
+
+# CP437 box-drawing glyphs, used for panel borders.
+BOX_TL, BOX_TR, BOX_BL, BOX_BR = "┌", "┐", "└", "┘"
+BOX_H, BOX_V = "─", "│"
+
+
+def find_keyboard_devices():
+    # See bars.py for why this filters by EV_KEY capability rather than
+    # hardcoding paths (remote controls split across several /dev/input
+    # nodes, node numbers aren't stable across reboots).
+    devices = []
+    for path in evdev.list_devices():
+        dev = evdev.InputDevice(path)
+        if dev.capabilities().get(ecodes.EV_KEY):
+            devices.append(dev)
+    if not devices:
+        sys.exit("No keyboard input device found (looked for devices with an EV_KEY capability)")
+    return devices
+
+
+class FrameBuffer:
+    """Direct writer for /dev/fb0, bypassing DRM page-flips entirely.
+
+    Verbatim copy of bars.py's FrameBuffer -- see that file for the full
+    rationale. Geometry is read from sysfs at open time since it depends
+    on whichever output (composite/HDMI) is currently active.
+    """
+
+    def __init__(self, dev="/dev/fb0"):
+        import mmap
+        import numpy as np
+
+        self._np = np
+        sys_dir = Path("/sys/class/graphics") / Path(dev).name
+        self.width, self.height = (int(x) for x in (sys_dir / "virtual_size").read_text().split(","))
+        self.bpp = int((sys_dir / "bits_per_pixel").read_text())
+        self.stride = int((sys_dir / "stride").read_text())
+        self.bypp = self.bpp // 8
+        self.row_bytes = self.width * self.bypp
+        size = self.stride * self.height
+        self.fd = os.open(dev, os.O_RDWR)
+        self.mm = mmap.mmap(self.fd, size, mmap.MAP_SHARED, mmap.PROT_WRITE | mmap.PROT_READ)
+        if self.bpp not in (16, 32):
+            raise RuntimeError(f"Unsupported framebuffer depth: {self.bpp}bpp")
+
+    def write_surface(self, surface):
+        np = self._np
+        if surface.get_size() != (self.width, self.height):
+            surface = pygame.transform.scale(surface, (self.width, self.height))
+        arr = pygame.surfarray.pixels3d(surface).transpose(1, 0, 2)  # (H, W, RGB) uint8
+        if self.bpp == 16:
+            r = arr[:, :, 0].astype(np.uint16) >> 3
+            g = arr[:, :, 1].astype(np.uint16) >> 2
+            b = arr[:, :, 2].astype(np.uint16) >> 3
+            raw = ((r << 11) | (g << 5) | b).astype("<u2").tobytes()
+        else:
+            alpha = np.zeros((self.height, self.width, 1), dtype=np.uint8)
+            raw = np.concatenate([arr[:, :, ::-1], alpha], axis=2).astype(np.uint8).tobytes()
+
+        if self.stride == self.row_bytes:
+            self.mm.seek(0)
+            self.mm.write(raw)
+        else:
+            for y in range(self.height):
+                self.mm.seek(y * self.stride)
+                self.mm.write(raw[y * self.row_bytes : (y + 1) * self.row_bytes])
+
+    def close(self):
+        self.mm.close()
+        os.close(self.fd)
+
+
+########  Stat-gathering  ######################################################
+
+def _vcgencmd(*args):
+    try:
+        result = subprocess.run(["vcgencmd", *args], capture_output=True, text=True, timeout=2)
+        return result.stdout.strip()
+    except (subprocess.SubprocessError, OSError):
+        return ""
+
+
+def get_cpu_temp():
+    out = _vcgencmd("measure_temp")
+    try:
+        return float(out.split("=")[1].split("'")[0])
+    except (IndexError, ValueError):
+        return None
+
+
+def get_cpu_clock_mhz():
+    out = _vcgencmd("measure_clock", "arm")
+    try:
+        hz = int(out.split("=")[1])
+        return hz / 1_000_000
+    except (IndexError, ValueError):
+        return None
+
+
+def get_throttled_status():
+    out = _vcgencmd("get_throttled")
+    try:
+        value = int(out.split("=")[1], 16)
+    except (IndexError, ValueError):
+        return "UNKNOWN"
+    # Bits 0-3 are *current* conditions; bits 16-19 are "has happened since
+    # boot" versions of the same four. Only the current bits matter for a
+    # live dashboard -- a footnote about past throttling isn't actionable.
+    if value & 0x1:
+        return "UNDERVOLTAGE"
+    if value & 0x4:
+        return "THROTTLED"
+    if value & 0x8:
+        return "TEMP LIMIT"
+    if value & 0x2:
+        return "FREQ CAPPED"
+    return "OK"
+
+
+def get_ip_address():
+    # Same UDP-connect trick as bars.py's get_ip_address() -- doesn't
+    # actually send anything, just asks the kernel which local address
+    # would be used to reach an external host.
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "NO NETWORK"
+    finally:
+        s.close()
+
+
+def get_wifi_link():
+    """Returns (quality_0_to_70, level_dbm) for WIFI_IFACE from
+    /proc/net/wireless, or (None, None) if not found."""
+    try:
+        lines = Path("/proc/net/wireless").read_text().splitlines()
+    except OSError:
+        return None, None
+    for line in lines:
+        line = line.strip()
+        if not line.startswith(f"{WIFI_IFACE}:"):
+            continue
+        fields = line.split(":", 1)[1].split()
+        try:
+            quality = float(fields[1])
+            level = float(fields[2])
+            return quality, level
+        except (IndexError, ValueError):
+            return None, None
+    return None, None
+
+
+def get_wifi_ssid():
+    try:
+        result = subprocess.run(
+            ["nmcli", "-t", "-f", "active,ssid", "dev", "wifi"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    for line in result.stdout.splitlines():
+        if line.startswith("yes:"):
+            return line.split(":", 1)[1]
+    return None
+
+
+class StatsPoller:
+    """Gathers all dashboard stats on a timer rather than every frame --
+    several of these shell out or hit the network, so re-running them on
+    every redraw would make the whole UI feel laggy (same precedent as
+    refresh_hardware_status() below)."""
+
+    def __init__(self):
+        self.stats = {}
+        self._last_net = None  # (timestamp, bytes_sent, bytes_recv)
+        psutil.cpu_percent(percpu=True)  # prime the delta -- first call is meaningless
+        self.refresh()
+
+    def refresh(self):
+        self.stats["cpu_temp"] = get_cpu_temp()
+        self.stats["cpu_clock_mhz"] = get_cpu_clock_mhz()
+        self.stats["throttled"] = get_throttled_status()
+        self.stats["cpu_percore"] = psutil.cpu_percent(percpu=True)
+        self.stats["loadavg"] = os.getloadavg()
+        self.stats["mem"] = psutil.virtual_memory()
+        self.stats["disk"] = psutil.disk_usage("/")
+        self.stats["wifi_quality"], self.stats["wifi_level"] = get_wifi_link()
+        self.stats["wifi_ssid"] = get_wifi_ssid()
+        self.stats["ip"] = get_ip_address()
+
+        now = time.time()
+        try:
+            io = psutil.net_io_counters(pernic=True).get(WIFI_IFACE)
+        except OSError:
+            io = None
+        if io is not None:
+            if self._last_net is not None:
+                elapsed = now - self._last_net[0]
+                if elapsed > 0:
+                    self.stats["net_up_kbs"] = (io.bytes_sent - self._last_net[1]) / 1024 / elapsed
+                    self.stats["net_down_kbs"] = (io.bytes_recv - self._last_net[2]) / 1024 / elapsed
+            self._last_net = (now, io.bytes_sent, io.bytes_recv)
+
+
+########  App-menu data  #######################################################
+
+LOUDNESS_SETTINGS_PATH = "/opt/loudness/settings.ini"
+LOUDNESS_DEVICE_RE = re.compile(r"^device\s*=\s*plughw:(\d+),(\d+)", re.MULTILINE)
+
+
+def check_sdr_dongle():
+    # Unused now that retro-radar is retired (moved aside, not deleted --
+    # see the *.retired-20260814 paths -- user's plan is to revisit it
+    # later). Kept rather than removed so re-adding retro-radar to APPS
+    # doesn't require reconstructing this check.
+    #
+    # There's no software-visible signal for "an antenna is attached" --
+    # this only confirms readsb has successfully claimed an RTL-SDR
+    # dongle over USB. readsb auto-restart-loops (systemd state
+    # "activating", never settling on "active") when no dongle is
+    # present, which makes `systemctl is-active` a solid proxy without
+    # reimplementing USB device scanning here.
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", "readsb.service"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    return result.stdout.strip() == "active"
+
+
+def check_loudness_mic():
+    # Reads the *currently configured* device out of LOUDNESS's own
+    # settings.ini rather than checking for "any mic" -- this is the
+    # same card/device pair LOUDNESS itself will try to open, so it
+    # catches the exact failure mode that already bit this Pi once
+    # (settings.ini's card number going stale after a USB re-enumeration).
+    try:
+        text = Path(LOUDNESS_SETTINGS_PATH).read_text()
+    except OSError:
+        return False
+    match = LOUDNESS_DEVICE_RE.search(text)
+    if not match:
+        return False
+    card, device = match.groups()
+    return Path(f"/dev/snd/pcmC{card}D{device}c").exists()
+
+
+def check_internet():
+    # Connects to a literal IP (not a hostname) so a dead connection
+    # fails fast instead of also waiting out a DNS timeout on top of the
+    # socket timeout.
+    try:
+        with socket.create_connection(("8.8.8.8", 53), timeout=1.5):
+            return True
+    except OSError:
+        return False
+
+
+# (key char, label, description, launcher command, main script -- read
+# for its own VERSION, hardware check -- None if the app has no
+# hardware dependency to poll for)
+APPS = [
+    ("1", "BARS ULRICH", "NTSC test pattern", "bars", "/opt/bars/bars.py", None),
+    ("2", "LOUDNESS", "Audio spectrum visualizer", "loudness", "/opt/loudness/loudness.py", check_loudness_mic),
+    ("3", "WEATHERSTAR 4000", "Current conditions", "weatherstar", "/opt/weatherstar/weatherstar_launcher.py", check_internet),
+    ("4", "CHANNEL 38", "Ole Miss sports ticker", "channel38", "/opt/channel38/channel38.py", check_internet),
+]
+
+VERSION_RE = re.compile(r"""VERSION\s*=\s*['"]([^'"]+)['"]""")
+
+
+def read_app_version(script_path):
+    # Each app owns its VERSION constant in its own source file (they may
+    # end up as separate GitHub repos eventually) -- scanning the source
+    # text for it avoids importing the module, which would drag in each
+    # app's own venv/hardware assumptions (retro-radar's kmsdrm venv in
+    # particular) just to read a string.
+    try:
+        text = Path(script_path).read_text()
+    except OSError:
+        return "?"
+    match = VERSION_RE.search(text)
+    return match.group(1) if match else "?"
+
+
+########  Rendering  ###########################################################
+
+class Panel:
+    """A titled, box-drawn rectangle in character-cell coordinates. Content
+    is drawn by whatever draw_fn(canvas, content_rect, stats) is passed in
+    -- content_rect is the pixel rect *inside* the border, in pixels."""
+
+    def __init__(self, col, row, w_chars, h_chars, title, draw_fn=None, subtitle=None):
+        self.col, self.row = col, row
+        self.w_chars, self.h_chars = w_chars, h_chars
+        self.title = title
+        self.subtitle = subtitle  # optional, right-justified in the bottom border
+        self.draw_fn = draw_fn
+
+
+class HealthDisplay:
+    def __init__(self, fb):
+        # Layout math is against FRAME_W/FRAME_H (the fixed canvas render()
+        # actually draws onto), NOT fb.width/fb.height (the real hardware
+        # framebuffer's resolution, e.g. 1024x768 on HDMI today) -- those
+        # are two different things, and FrameBuffer.write_surface() is what
+        # stretches the FRAME_W x FRAME_H canvas to fit whichever real
+        # resolution is active. Mixing the two caused the dashboard to
+        # render far too large and run off-screen the first time around.
+        self._fb = fb
+
+        self._margin_x = int(FRAME_W * UNDERSCAN)
+        self._margin_y = int(FRAME_H * UNDERSCAN)
+        usable_w = FRAME_W - 2 * self._margin_x
+        usable_h = FRAME_H - 2 * self._margin_y
+
+        # Pick the largest point size whose 'M' width still fits
+        # TARGET_WIDTH columns in the underscanned area -- a hardcoded
+        # point size doesn't track how many actual pixels a TTF's glyphs
+        # end up occupying, and badly undersized the whole dashboard the
+        # first time around (channel38's Display uses this same
+        # measure-then-pick approach for the same reason). Shared by both
+        # the health dashboard and the app-menu screen -- one font, one
+        # character grid, for the whole program now.
+        self._font = self._fit_font(TARGET_WIDTH, usable_w)
+        self._label_font = self._font
+
+        self._char_w = self._font.size("M")[0]
+        self._char_h = self._font.get_linesize()
+        max_width = max(1, usable_w // self._char_w)
+        self._width = min(TARGET_WIDTH, max_width)
+        self._height = max(1, usable_h // self._char_h)
+
+        # Border-only font (see module docstring) -- fit to one character
+        # cell of the body font's grid, not the whole row, since it only
+        # ever draws one glyph per cell.
+        self._border_font = self._fit_font(1, self._char_w, font_path=BORDER_FONT_PATH)
+
+    @staticmethod
+    def _fit_font(target_width_chars, usable_w, max_size=64, min_size=8, font_path=None):
+        font_path = font_path or FONT_PATH
+        for size in range(max_size, min_size - 1, -1):
+            candidate = pygame.font.Font(str(font_path), size)
+            if candidate.size("M")[0] * target_width_chars <= usable_w:
+                return candidate
+        return pygame.font.Font(str(font_path), min_size)
+
+    def char_px(self, col, row):
+        return (self._margin_x + col * self._char_w, self._margin_y + row * self._char_h)
+
+    def draw_text(self, canvas, col, row, text, color=ORANGE, bold=False, font=None):
+        font = font or self._font
+        font.set_bold(bold)
+        surf = font.render(text, True, color)
+        canvas.blit(surf, self.char_px(col, row))
+
+    def draw_panel_frame(self, canvas, panel):
+        """Box-drawn border in character-cell coordinates, with an
+        optional title embedded in the top border (left-justified, right
+        after the top-left corner) and an optional subtitle embedded in
+        the bottom border (right-justified, right before the bottom-right
+        corner -- mirrors the title's placement on the opposite corner).
+        Used both for the health dashboard's gauge panels and the app-menu's
+        outer box.
+
+        The border glyphs (corners/BOX_H/BOX_V) are drawn one cell at a
+        time with self._border_font (see module docstring -- the body
+        font, VCR OSD MONO, has no box-drawing glyphs). Title/subtitle
+        text is drawn with the normal body font -- the two fonts don't
+        share a baseline/cap-height, so a title blitted *on top of* a
+        BOX_H line left a sliver of the line visible under the text
+        (confirmed on the real CRT 2026-08-14). Fixed by leaving the
+        title/subtitle's cells out of the BOX_H fill entirely -- true
+        blank cells, not an overlap -- so there's nothing under the text
+        to peek out: corner, blank run, title, blank run, BOX_H the rest
+        of the way."""
+        x, y = self.char_px(panel.col, panel.row)
+        inner_w = panel.w_chars - 2
+        # Title sits 2 extra glyphs in from the corner (2026-08-14, user
+        # request) -- corner, 2x BOX_H, blank run, title, blank run, then
+        # BOX_H the rest of the way. Subtitle (bottom-right) is unchanged.
+        TITLE_INDENT = 3
+        title_text = (f" {panel.title} " if panel.title else "")[: max(0, inner_w - (TITLE_INDENT - 1))]
+        subtitle_text = (f" {panel.subtitle} " if panel.subtitle else "")[:inner_w]
+        title_cols = set(range(TITLE_INDENT, TITLE_INDENT + len(title_text)))
+        subtitle_start = panel.w_chars - 1 - len(subtitle_text)
+        subtitle_cols = set(range(subtitle_start, panel.w_chars - 1))
+        # bold=True: same interlace-flicker reasoning as draw_bar()'s 2px
+        # border -- these box-drawing glyphs' strokes are only ~1px at
+        # this font size, and synthetic bold is the only way to thicken a
+        # font-rendered glyph (there's no line-width knob like
+        # pygame.draw.rect has). Applies to the title/subtitle text too,
+        # which reads fine.
+        bottom_row = panel.row + panel.h_chars - 1
+        self.draw_text(canvas, panel.col, panel.row, BOX_TL, bold=True, font=self._border_font)
+        self.draw_text(canvas, panel.col + panel.w_chars - 1, panel.row, BOX_TR, bold=True, font=self._border_font)
+        self.draw_text(canvas, panel.col, bottom_row, BOX_BL, bold=True, font=self._border_font)
+        self.draw_text(canvas, panel.col + panel.w_chars - 1, bottom_row, BOX_BR, bold=True, font=self._border_font)
+        for c in range(1, panel.w_chars - 1):
+            if c not in title_cols:
+                self.draw_text(canvas, panel.col + c, panel.row, BOX_H, bold=True, font=self._border_font)
+            if c not in subtitle_cols:
+                self.draw_text(canvas, panel.col + c, bottom_row, BOX_H, bold=True, font=self._border_font)
+        if title_text:
+            self.draw_text(canvas, panel.col + TITLE_INDENT, panel.row, title_text, bold=True)
+        if subtitle_text:
+            self.draw_text(canvas, panel.col + subtitle_start, bottom_row, subtitle_text, bold=True)
+        for r in range(1, panel.h_chars - 1):
+            self.draw_text(canvas, panel.col, panel.row + r, BOX_V, bold=True, font=self._border_font)
+            self.draw_text(canvas, panel.col + panel.w_chars - 1, panel.row + r, BOX_V, bold=True, font=self._border_font)
+
+        content_x = x + self._char_w
+        content_y = y + self._char_h
+        content_w = (panel.w_chars - 2) * self._char_w
+        content_h = (panel.h_chars - 2) * self._char_h
+        return pygame.Rect(content_x, content_y, content_w, content_h)
+
+    def draw_bar(self, canvas, rect, fraction, label=None, color=ORANGE):
+        """`rect` is the *full* available width for bar + label combined --
+        the label's actual rendered width is measured first and the bar
+        gets whatever's left, rather than assuming a fixed label width
+        that doesn't track font size (that fixed-budget approach is what
+        let labels run past the panel edge at larger auto-fit sizes).
+        The bar's own left edge is inset by one character width so it
+        lines up with the left-indented text lines above/below it
+        (2026-08-14). Also 2px shorter than the caller's rect, with the
+        top edge moved down to absorb it (bottom edge unchanged) -- a
+        small gap between the bar and the line of text above it, and
+        closer to the text glyph height next to it (2026-08-14)."""
+        fraction = max(0.0, min(1.0, fraction))
+        bar_rect = pygame.Rect(rect.x + self._char_w, rect.y + 2, rect.width - self._char_w, rect.height - 2)
+        label_surf = None
+        if label:
+            label_surf = self._label_font.render(label, True, ORANGE)
+            bar_rect.width -= label_surf.get_width() + 12
+        # Border is 2px, not 1px -- a single-scanline-thin horizontal edge
+        # only lands on one of the two interlaced fields each frame, which
+        # reads as visible jitter/flicker on a real CRT (inherent to
+        # interlacing, not a rendering bug -- confirmed on real composite
+        # output). 2px puts the top/bottom edges on both fields every
+        # frame. The fill inset grows to match so it still sits cleanly
+        # inside the thicker border rather than overlapping it.
+        pygame.draw.rect(canvas, ORANGE, bar_rect, 2)
+        fill_w = int((bar_rect.width - 4) * fraction)
+        if fill_w > 0:
+            pygame.draw.rect(canvas, color, (bar_rect.x + 2, bar_rect.y + 2, fill_w, bar_rect.height - 4))
+        if label_surf:
+            canvas.blit(label_surf, (bar_rect.right + 8, rect.y + (rect.height - label_surf.get_height()) // 2))
+
+    def render_page(self, canvas, panels, stats):
+        canvas.fill(BLACK)
+        for panel in panels:
+            content_rect = self.draw_panel_frame(canvas, panel)
+            panel.draw_fn(self, canvas, content_rect, stats)
+
+
+########  Health panel content  ################################################
+
+def draw_cpu_panel(display, canvas, rect, stats):
+    # TEMP/CLOCK share one row (only 14 usable rows exist at this font
+    # size for both panels' combined minimum content -- see the
+    # panel-height computation in HealthApp.__init__).
+    y = rect.y
+    temp = stats.get("cpu_temp")
+    temp_text = f"{temp * 9 / 5 + 32:.1f} F" if temp is not None else "N/A"
+    clock = stats.get("cpu_clock_mhz")
+    # Width-4 so a 3-digit clock speed (600) gets a leading space to match
+    # a 4-digit one (1400) -- keeps CLOCK/MHZ from jittering left-right as
+    # the value crosses that digit-count boundary.
+    clock_text = f"{clock:4.0f} MHZ" if clock is not None else "N/A"
+    surf = display._font.render(f" TEMP: {temp_text}   CLOCK: {clock_text}", True, ORANGE)
+    canvas.blit(surf, (rect.x, y))
+    y += display._char_h
+
+    percore = stats.get("cpu_percore") or []
+    for i, pct in enumerate(percore):
+        bar_rect = pygame.Rect(rect.x, y, rect.width, display._char_h - 4)
+        display.draw_bar(canvas, bar_rect, pct / 100.0, label=f" CORE{i} {pct:4.0f}% ")
+        y += display._char_h
+
+    # Flows directly after the core bars rather than pinned to rect.bottom
+    # -- anchoring it independently of how much space the bars above
+    # actually used is what caused it to overlap the last core's bar.
+    load1, load5, load15 = stats.get("loadavg", (0, 0, 0))
+    surf = display._font.render(f" LOAD: {load1:.2f} {load5:.2f} {load15:.2f}", True, ORANGE)
+    canvas.blit(surf, (rect.x, y))
+    y += display._char_h
+
+    status = stats.get("throttled", "UNKNOWN")
+    surf = display._font.render(f" STATUS: {status}", True, ORANGE)
+    canvas.blit(surf, (rect.x, y))
+
+
+def draw_memory_panel(display, canvas, rect, stats):
+    mem = stats.get("mem")
+    if mem is None:
+        return
+    y = rect.y
+    bar_rect = pygame.Rect(rect.x, y, rect.width, display._char_h - 4)
+    display.draw_bar(canvas, bar_rect, mem.percent / 100.0, label=f" {mem.percent:.0f}% ")
+    y += display._char_h
+
+    used_mb = mem.used / (1024 * 1024)
+    total_mb = mem.total / (1024 * 1024)
+    surf = display._font.render(f" USED:  {used_mb:.0f} MB", True, ORANGE)
+    canvas.blit(surf, (rect.x, y))
+    y += display._char_h
+    surf = display._font.render(f" TOTAL: {total_mb:.0f} MB", True, ORANGE)
+    canvas.blit(surf, (rect.x, y))
+
+
+def draw_storage_panel(display, canvas, rect, stats):
+    disk = stats.get("disk")
+    if disk is None:
+        return
+    y = rect.y
+    bar_rect = pygame.Rect(rect.x, y, rect.width, display._char_h - 4)
+    display.draw_bar(canvas, bar_rect, disk.percent / 100.0, label=f" {disk.percent:.0f}% ")
+    y += display._char_h
+
+    used_gb = disk.used / (1024 ** 3)
+    free_gb = disk.free / (1024 ** 3)
+    surf = display._font.render(f" {used_gb:.0f} GB USED   {free_gb:.0f} GB FREE", True, ORANGE)
+    canvas.blit(surf, (rect.x, y))
+
+
+def draw_wifi_panel(display, canvas, rect, stats):
+    y = rect.y
+    ssid = stats.get("wifi_ssid") or "NOT CONNECTED"
+    surf = display._font.render(f" SSID: {ssid}", True, ORANGE)
+    canvas.blit(surf, (rect.x, y))
+    y += display._char_h
+
+    ip = stats.get("ip", "N/A")
+    surf = display._font.render(f" IP: {ip}", True, ORANGE)
+    canvas.blit(surf, (rect.x, y))
+    y += display._char_h
+
+    quality = stats.get("wifi_quality")
+    level = stats.get("wifi_level")
+    if quality is not None:
+        bar_rect = pygame.Rect(rect.x, y, rect.width, display._char_h - 4)
+        display.draw_bar(canvas, bar_rect, quality / 70.0, label=f" {quality:.0f}/70 ")
+        y += display._char_h
+        surf = display._font.render(f" SIGNAL: {level:.0f} DBM", True, ORANGE)
+        canvas.blit(surf, (rect.x, y))
+    else:
+        surf = display._font.render(" NO WIRELESS LINK", True, ORANGE)
+        canvas.blit(surf, (rect.x, y))
+
+
+def draw_network_panel(display, canvas, rect, stats):
+    y = rect.y
+    up = stats.get("net_up_kbs")
+    down = stats.get("net_down_kbs")
+    up_text = f"{up:6.1f} KB/S" if up is not None else "  --.- KB/S"
+    down_text = f"{down:6.1f} KB/S" if down is not None else "  --.- KB/S"
+    surf = display._font.render(f" UP:   {up_text}", True, ORANGE)
+    canvas.blit(surf, (rect.x, y))
+    y += display._char_h
+    surf = display._font.render(f" DOWN: {down_text}", True, ORANGE)
+    canvas.blit(surf, (rect.x, y))
+
+
+########  App  ##################################################################
+
+class HealthApp:
+    def __init__(self):
+        self._quit_requested = False
+        signal.signal(signal.SIGTERM, self._handle_signal)
+        signal.signal(signal.SIGINT, self._handle_signal)
+
+        pygame.display.init()
+        pygame.font.init()
+        pygame.display.set_mode((FRAME_W, FRAME_H))  # headless (dummy driver); needed for .convert()
+
+        self.fb = FrameBuffer()
+        self.display = HealthDisplay(self.fb)
+        self.poller = StatsPoller()
+
+        self.osd_font = pygame.font.Font(str(FONT_PATH), 32)
+        self.option_font = pygame.font.Font(str(FONT_PATH), 28)
+
+        # "health" or "menu" -- which screen is currently showing. Switching
+        # between them is just this flag + a redraw (see handle_keycode()),
+        # not a process launch -- see the module docstring for why.
+        self.screen = "health"
+
+        # Health-dashboard panel layout. Panel columns/rows are computed
+        # from the display's actual usable grid (not hardcoded) so the
+        # dashboard fills the underscanned area regardless of font size/
+        # resolution -- one row is reserved at the TOP for the headline
+        # (see build_health_canvas), panels start at row 1 instead of 0.
+        # Stacked (full-width, split-height) rather than side-by-side.
+        # All four panels are now sized to their own exact content need
+        # (a fixed row count) rather than CPU/WIFI taking "whatever's
+        # left" -- that remainder-based sizing was carrying slack (1
+        # blank row in CPU, 3 in WIFI, 1 in NETWORK below their last
+        # content line) that this tightens up, per the user's request
+        # 2026-08-14. Any leftover space below the panels is deliberately
+        # left blank, not redistributed anywhere.
+        w = self.display._width
+        CPU_CONTENT_ROWS = 7  # TEMP/CLOCK line, 4 core bars, LOAD, STATUS
+        MEM_CONTENT_ROWS = 3  # bar, USED line, TOTAL line
+        WIFI_CONTENT_ROWS = 4  # SSID, IP, quality bar, SIGNAL -- gap row removed 2026-08-14
+        NET_CONTENT_ROWS = 2  # UP, DOWN
+        STORAGE_CONTENT_ROWS = 2  # bar, USED/FREE line
+        cpu_h = CPU_CONTENT_ROWS + 2  # +2 for border -- no spare left in the row budget
+        mem_h = MEM_CONTENT_ROWS + 2
+        wifi_h = WIFI_CONTENT_ROWS + 2
+        net_h = NET_CONTENT_ROWS + 2
+        storage_h = STORAGE_CONTENT_ROWS + 2
+        self.pages = [
+            [
+                Panel(0, 1, w, cpu_h, "CPU", draw_cpu_panel),
+                Panel(0, 1 + cpu_h, w, mem_h, "MEMORY", draw_memory_panel),
+            ],
+            [
+                Panel(0, 1, w, wifi_h, "WIFI", draw_wifi_panel),
+                Panel(0, 1 + wifi_h, w, net_h, "NETWORK", draw_network_panel),
+                Panel(0, 1 + wifi_h + net_h, w, storage_h, "STORAGE", draw_storage_panel),
+            ],
+        ]
+        self.current_page = 0
+        self.hostname = socket.gethostname().upper()
+
+        # App-menu screen state.
+        self.selected = 0
+        self.hardware_status = {}
+        self.refresh_hardware_status()
+
+        self.power_dialog_active = False
+        self.power_dialog_selection = 0
+        self.pending_power_action = None
+        self._rel_accum = {"x": 0, "y": 0}
+
+        self.kbd_devices = find_keyboard_devices()
+        self.selector = selectors.DefaultSelector()
+        for dev in self.kbd_devices:
+            self.selector.register(dev, selectors.EVENT_READ)
+
+        self.tty_fd = None
+        self.console_graphics_mode = False
+        self.acquire_console()
+
+    def _handle_signal(self, signum, frame):
+        self._quit_requested = True
+
+    def acquire_console(self):
+        self.fb = FrameBuffer()
+        self.display._fb = self.fb
+        self.tty_fd = None
+        self.console_graphics_mode = False
+        try:
+            self.tty_fd = os.open("/dev/tty", os.O_RDWR)
+            fcntl.ioctl(self.tty_fd, KDSETMODE, KD_GRAPHICS)
+            self.console_graphics_mode = True
+        except OSError as exc:
+            print(f"Console graphics mode not available: {exc}", file=sys.stderr)
+
+    def release_console(self):
+        if self.console_graphics_mode:
+            fcntl.ioctl(self.tty_fd, KDSETMODE, KD_TEXT)
+            os.write(self.tty_fd, b"\033[2J\033[H")
+        if self.tty_fd is not None:
+            os.close(self.tty_fd)
+            self.tty_fd = None
+        self.fb.close()
+
+    def drain_stale_events(self):
+        # evdev delivers to every open reader, so our own fds are still
+        # holding whatever key just quit the child app, unread.
+        for dev in self.kbd_devices:
+            try:
+                while dev.read_one() is not None:
+                    pass
+            except (BlockingIOError, OSError):
+                pass
+
+    def refresh_hardware_status(self):
+        # Run at startup and again every time control returns from a
+        # launched app (see launch_app) rather than on every redraw --
+        # these checks shell out / hit the network, so re-running them on
+        # every arrow-key press would make navigation feel laggy.
+        status = {}
+        for _key, _label, _desc, cmd, _script, hw_check in APPS:
+            if hw_check is None:
+                status[cmd] = True
+                continue
+            try:
+                status[cmd] = hw_check()
+            except Exception:
+                # A broken check should read as "hardware not found," not
+                # take the whole menu down.
+                status[cmd] = False
+        self.hardware_status = status
+
+    def render(self):
+        canvas = pygame.Surface((FRAME_W, FRAME_H))
+        if self.screen == "health":
+            self.build_health_canvas(canvas)
+        else:
+            self.build_menu_canvas(canvas)
+        if self.power_dialog_active:
+            self.draw_power_dialog(canvas)
+        self.fb.write_surface(canvas)
+
+    def build_health_canvas(self, canvas):
+        panels = self.pages[self.current_page]
+        self.display.render_page(canvas, panels, self.poller.stats)
+
+        headline = f"{self.hostname} - PAGE {self.current_page + 1}/{len(self.pages)}"
+        headline_surf = self.display._label_font.render(headline, True, ORANGE)
+        row0_y = self.display.char_px(0, 0)[1]
+        canvas.blit(headline_surf, ((FRAME_W - headline_surf.get_width()) // 2, row0_y))
+
+    def build_menu_canvas(self, canvas):
+        canvas.fill(BLACK)
+        d = self.display
+
+        box_rows = d._height  # no footer reserved below the box anymore (2026-08-14) -- box fills the full usable height
+        self.display.draw_panel_frame(canvas, Panel(
+            0, 0, d._width, box_rows, f"CENTRAL SCRUTINIZER {VERSION}".upper(), subtitle="BY METAL SHOP"))
+
+        rows_per_app = 2  # label+version row, description row
+        total_rows = rows_per_app * len(APPS)
+        start_row = 2 + max(0, (box_rows - 3 - total_rows) // 2)
+
+        row = start_row
+        for idx, (_key, label, desc, cmd, script_path, _hw_check) in enumerate(APPS):
+            selected = idx == self.selected
+            text_color = BLACK if selected else ORANGE
+            highlight_x, px_y = d.char_px(1, row)
+            px_x = highlight_x + d._char_w  # one extra space between the border/highlight and the text
+            if selected:
+                highlight_w = (d._width - 2) * d._char_w
+                # Inset from the outer box's border by a few px on each
+                # side (2026-08-14) -- previously expanded *outward* from
+                # the exact content width instead, which put the
+                # highlight right up against/into the border.
+                HIGHLIGHT_GAP = 4
+                pygame.draw.rect(canvas, ORANGE, (
+                    highlight_x + HIGHLIGHT_GAP, px_y - 2,
+                    highlight_w - 2 * HIGHLIGHT_GAP, d._char_h * 2 + 2))
+            app_version = read_app_version(script_path)
+            line = d._font.render(f"{label} {app_version}".upper(), True, text_color)
+            canvas.blit(line, (px_x, px_y))
+            hw_ok = self.hardware_status.get(cmd, True)
+            desc_text = desc.upper() if hw_ok else "HARDWARE NOT FOUND"
+            # RED on the normal black background makes the warning stand
+            # out; on the selected row's orange highlight it stays BLACK
+            # like the rest of that row's text -- red-on-orange is low
+            # contrast, and the text itself already reads as a warning.
+            desc_color = text_color if (hw_ok or selected) else RED
+            desc_line = d._font.render(desc_text, True, desc_color)
+            canvas.blit(desc_line, (px_x + d._char_w * 2, px_y + d._char_h))
+            row += rows_per_app
+
+    def draw_power_dialog(self, canvas):
+        lines = ["ARE YOU SURE YOU WANT", "TO SHUT DOWN?"]
+        line_surfs = [self.osd_font.render(line, True, ORANGE) for line in lines]
+        option_surfs = [
+            self.option_font.render(opt, True, BLACK if i == self.power_dialog_selection else ORANGE)
+            for i, opt in enumerate(POWER_OPTIONS)
+        ]
+
+        pad_x, pad_y, gap = 40, 24, 40
+        options_w = sum(s.get_width() for s in option_surfs) + gap * (len(option_surfs) - 1)
+        content_w = max(max(s.get_width() for s in line_surfs), options_w)
+        content_h = (sum(s.get_height() for s in line_surfs) + 10 * (len(line_surfs) - 1)
+                     + 30 + option_surfs[0].get_height())
+
+        box = pygame.Surface((content_w + pad_x * 2, content_h + pad_y * 2))
+        box.fill(BLACK)
+        pygame.draw.rect(box, ORANGE, box.get_rect(), 3)
+
+        y = pad_y
+        for surf in line_surfs:
+            box.blit(surf, ((box.get_width() - surf.get_width()) // 2, y))
+            y += surf.get_height() + 10
+        y += 20
+
+        x = (box.get_width() - options_w) // 2
+        for i, surf in enumerate(option_surfs):
+            if i == self.power_dialog_selection:
+                highlight = pygame.Rect(x - 10, y - 6, surf.get_width() + 20, surf.get_height() + 12)
+                pygame.draw.rect(box, ORANGE, highlight)
+            box.blit(surf, (x, y))
+            x += surf.get_width() + gap
+
+        canvas.blit(box, ((FRAME_W - box.get_width()) // 2, (FRAME_H - box.get_height()) // 2))
+
+    def launch_app(self, cmd):
+        """Launches one of the real apps as an actual subprocess (unlike
+        switching between the health/menu screens, these are genuinely
+        separate programs needing real console ownership). Switches to the
+        health screen if the app's Home button was pressed (it exits with
+        EXIT_GOTO_HOME to signal that) -- otherwise stays on the menu
+        screen and refreshes hardware status."""
+        self.release_console()
+        result = None
+        try:
+            result = subprocess.run([cmd])
+        finally:
+            self.acquire_console()
+            self.drain_stale_events()
+        if result is not None and result.returncode == EXIT_GOTO_HOME:
+            self.screen = "health"
+            self.poller.refresh()
+        else:
+            self.refresh_hardware_status()
+        self.render()
+
+    def handle_keycode(self, code):
+        """Returns True if the app should redraw after this key."""
+        if self.power_dialog_active:
+            return self.handle_power_dialog_keycode(code)
+        if code in (ecodes.KEY_Q, ecodes.KEY_ESC):
+            self._quit_requested = True
+        elif code == ecodes.KEY_POWER:
+            self.power_dialog_active = True
+            self.power_dialog_selection = 0
+        elif self.screen == "health":
+            return self._handle_health_keycode(code)
+        else:
+            return self._handle_menu_keycode(code)
+        return True
+
+    def _handle_health_keycode(self, code):
+        if code == ecodes.KEY_COMPOSE:  # hamburger/Menu button
+            self.screen = "menu"
+        elif code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME, ecodes.KEY_BACK):
+            pass  # already home -- no-op
+        elif code == ecodes.KEY_LEFT:
+            self.current_page = (self.current_page - 1) % len(self.pages)
+        elif code == ecodes.KEY_RIGHT:
+            self.current_page = (self.current_page + 1) % len(self.pages)
+        else:
+            return False
+        return True
+
+    def _handle_menu_keycode(self, code):
+        if code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME, ecodes.KEY_BACK):
+            self.screen = "health"
+        elif code == ecodes.KEY_COMPOSE:
+            pass  # already at the app menu -- no-op
+        elif code == ecodes.KEY_UP:
+            self.selected = (self.selected - 1) % len(APPS)
+        elif code == ecodes.KEY_DOWN:
+            self.selected = (self.selected + 1) % len(APPS)
+        elif code in (ecodes.KEY_ENTER, ecodes.KEY_KPENTER, ecodes.BTN_LEFT, ecodes.BTN_MOUSE):
+            self.launch_app(APPS[self.selected][3])
+            return False  # launch_app() already rendered
+        else:
+            return False
+        return True
+
+    def handle_power_dialog_keycode(self, code):
+        if code in (ecodes.KEY_LEFT, ecodes.KEY_UP):
+            self.power_dialog_selection = (self.power_dialog_selection - 1) % len(POWER_OPTIONS)
+        elif code in (ecodes.KEY_RIGHT, ecodes.KEY_DOWN):
+            self.power_dialog_selection = (self.power_dialog_selection + 1) % len(POWER_OPTIONS)
+        elif code in (ecodes.KEY_ENTER, ecodes.KEY_KPENTER, ecodes.BTN_LEFT, ecodes.BTN_MOUSE):
+            choice = POWER_OPTIONS[self.power_dialog_selection]
+            if choice == "NO":
+                self.power_dialog_active = False
+            else:
+                return "shutdown" if choice == "YES" else "restart"
+        elif code in (ecodes.KEY_ESC, ecodes.KEY_BACK, ecodes.KEY_POWER):
+            self.power_dialog_active = False
+        else:
+            return False
+        return True
+
+    def handle_rel_event(self, code, value):
+        if code == ecodes.REL_X:
+            axis = "x"
+        elif code == ecodes.REL_Y:
+            axis = "y"
+        else:
+            return False
+        self._rel_accum[axis] += value
+        accum = self._rel_accum[axis]
+        if abs(accum) < MOUSE_MOVE_THRESHOLD:
+            return False
+        self._rel_accum[axis] = 0
+        if axis == "x":
+            synthetic = ecodes.KEY_RIGHT if accum > 0 else ecodes.KEY_LEFT
+        else:
+            synthetic = ecodes.KEY_DOWN if accum > 0 else ecodes.KEY_UP
+        return self.handle_keycode(synthetic)
+
+    def run(self):
+        try:
+            self.render()
+            last_stats_refresh = time.time()
+            last_input_time = time.time()
+            while not self._quit_requested:
+                for key, _ in self.selector.select(timeout=IDLE_POLL_TIMEOUT):
+                    device = key.fileobj
+                    for event in device.read():
+                        if event.type == ecodes.EV_KEY and event.value == 1:
+                            result = self.handle_keycode(event.code)
+                        elif event.type == ecodes.EV_REL:
+                            result = self.handle_rel_event(event.code, event.value)
+                        else:
+                            continue
+                        last_input_time = time.time()
+                        if result in ("shutdown", "restart"):
+                            self.pending_power_action = result
+                            self._quit_requested = True
+                        elif result:
+                            self.render()
+                    if self._quit_requested:
+                        break
+
+                if self._quit_requested:
+                    break
+
+                now = time.time()
+                if self.screen == "health" and now - last_stats_refresh >= STATS_REFRESH_SECONDS:
+                    self.poller.refresh()
+                    last_stats_refresh = now
+                    self.render()
+                # Screensaver: 2 minutes idle while sitting at the menu
+                # screen (not the health screen, not mid-dialog) switches
+                # back to health exactly like a Back/Home press would.
+                elif (self.screen == "menu" and not self.power_dialog_active
+                        and now - last_input_time >= IDLE_TIMEOUT_SECONDS):
+                    self.screen = "health"
+                    self.poller.refresh()
+                    last_input_time = now
+                    self.render()
+        finally:
+            self.fb.close()
+            if self.console_graphics_mode:
+                fcntl.ioctl(self.tty_fd, KDSETMODE, KD_TEXT)
+                os.write(self.tty_fd, b"\033[2J\033[H")
+            if self.tty_fd is not None:
+                os.close(self.tty_fd)
+            pygame.quit()
+
+        if self.pending_power_action == "shutdown":
+            subprocess.run(["sudo", "shutdown", "-h", "now"])
+        elif self.pending_power_action == "restart":
+            subprocess.run(["sudo", "shutdown", "-r", "now"])
+
+
+def main():
+    HealthApp().run()
+
+
+if __name__ == "__main__":
+    main()
