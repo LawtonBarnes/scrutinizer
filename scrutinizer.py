@@ -939,7 +939,10 @@ class HealthApp:
         else:
             stats, fresh = self.remote_poller.get(self.monitor_target)
             offline = not fresh or stats is None
-            target_label = self.monitor_target
+            # Full hostname (e.g. "PUPPET-2"), not the short P2 name --
+            # only available once we've actually heard from it at least
+            # once, so fall back to the short name until then/if offline.
+            target_label = (stats or {}).get("hostname", self.monitor_target).upper()
             panels = self._remote_panels(self.current_page)
 
         if offline:
@@ -970,13 +973,29 @@ class HealthApp:
         hardware_status = self._current_hardware_status()
         if self.monitor_target == "LOCAL":
             title = f"CENTRAL SCRUTINIZER {VERSION}".upper()
+            target_label = self.hostname
         else:
-            _stats, fresh = self.remote_poller.get(self.monitor_target)
+            stats, fresh = self.remote_poller.get(self.monitor_target)
             title = f"ASSIGN TO {self.monitor_target}{'' if fresh else ' (OFFLINE)'}".upper()
+            # Full hostname for the headline below, same fallback as
+            # build_health_canvas -- box title keeps the short P2-style
+            # name, it's compact and already fits the border nicely.
+            target_label = (stats or {}).get("hostname", self.monitor_target).upper()
 
         box_rows = d._height  # no footer reserved below the box anymore (2026-08-14) -- box fills the full usable height
         self.display.draw_panel_frame(canvas, Panel(
             0, 0, d._width, box_rows, title, subtitle="BY METAL SHOP"))
+
+        # Same "{TARGET} - PAGE n/m" headline pages 0/1 show, so it's
+        # clear which machine you're controlling here too -- sits in the
+        # first blank content row below the border. No layout
+        # recalculation needed: start_row below already reserves rows
+        # 0-1 regardless of app count, this just uses row 1 of that
+        # existing slack instead of leaving it blank.
+        headline = f"{target_label} - PAGE {self.current_page + 1}/{PAGE_COUNT}"
+        headline_surf = d._label_font.render(headline, True, ORANGE)
+        row1_y = d.char_px(0, 1)[1]
+        canvas.blit(headline_surf, ((FRAME_W - headline_surf.get_width()) // 2, row1_y))
 
         rows_per_app = 2  # label+version row, description row
         total_rows = rows_per_app * MENU_ITEM_COUNT
