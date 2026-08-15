@@ -34,6 +34,7 @@ an Ac font here would double-correct. Re-check this once ever run on real
 composite/CRT output where that stretch may not happen at all.
 """
 import fcntl
+import json
 import os
 import re
 import selectors
@@ -41,8 +42,11 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
+import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 import evdev
 import psutil
@@ -73,6 +77,21 @@ KD_GRAPHICS = 0x01
 STATS_REFRESH_SECONDS = 1.0  # health screen: how often to re-poll CPU/WiFi stats
 IDLE_POLL_TIMEOUT = 1.0
 IDLE_TIMEOUT_SECONDS = 120  # menu screen: screensaver, hand off to health after 2 idle minutes
+
+# McBrain remote monitoring -- Up/Down on the health screen cycles which
+# of these (or LOCAL) is displayed. IPs match the p1-p4 SSH aliases in
+# ~/.ssh/config (see project_naming_conventions). Port matches STRINGS's
+# fixed listen port on every puppet.
+PUPPETS = [
+    ("P1", "192.168.68.72"),
+    ("P2", "192.168.68.65"),
+    ("P3", "192.168.68.68"),
+    ("P4", "192.168.68.64"),
+]
+MONITOR_TARGETS = ["LOCAL"] + [name for name, _ip in PUPPETS]
+PUPPET_PORT = 8420
+PUPPET_POLL_TIMEOUT_SECONDS = 2
+PUPPET_POLL_INTERVAL_SECONDS = 3
 
 POWER_OPTIONS = ["NO", "YES", "RESTART"]
 MOUSE_MOVE_THRESHOLD = 12  # cumulative REL_X/REL_Y units before it counts as one direction press
@@ -287,6 +306,55 @@ class StatsPoller:
                     self.stats["net_up_kbs"] = (io.bytes_sent - self._last_net[1]) / 1024 / elapsed
                     self.stats["net_down_kbs"] = (io.bytes_recv - self._last_net[2]) / 1024 / elapsed
             self._last_net = (now, io.bytes_sent, io.bytes_recv)
+
+
+class RemotePoller:
+    """Polls every puppet's STRINGS /status endpoint over the LAN, on its
+    own background thread -- unlike StatsPoller (called synchronously
+    from the main loop, fine since local vcgencmd/psutil calls are fast),
+    an HTTP request to a slow or offline puppet could block for the full
+    timeout, and with 4 puppets that's long enough to visibly stall input
+    handling if done inline. One puppet being unreachable also must never
+    hold up polling the other three, so each is fetched independently."""
+
+    def __init__(self):
+        self._stats = {name: None for name, _ip in PUPPETS}
+        self._fresh = {name: False for name, _ip in PUPPETS}
+        self._lock = threading.Lock()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def get(self, name):
+        """Returns (stats_dict_or_None, fresh_bool)."""
+        with self._lock:
+            return self._stats.get(name), self._fresh.get(name, False)
+
+    def _run(self):
+        while True:
+            for name, ip in PUPPETS:
+                self._poll_one(name, ip)
+            time.sleep(PUPPET_POLL_INTERVAL_SECONDS)
+
+    def _poll_one(self, name, ip):
+        try:
+            url = f"http://{ip}:{PUPPET_PORT}/status"
+            with urllib.request.urlopen(url, timeout=PUPPET_POLL_TIMEOUT_SECONDS) as resp:
+                data = json.loads(resp.read())
+        except (OSError, ValueError):
+            with self._lock:
+                self._fresh[name] = False
+            return
+        # STRINGS reports mem/disk as plain JSON objects; the existing
+        # draw_memory_panel/draw_storage_panel were written against
+        # psutil's namedtuple-style objects (attribute access, e.g.
+        # mem.percent) -- wrapping in SimpleNamespace lets those
+        # functions run completely unchanged against remote data too.
+        if data.get("mem") is not None:
+            data["mem"] = SimpleNamespace(**data["mem"])
+        if data.get("disk") is not None:
+            data["disk"] = SimpleNamespace(**data["disk"])
+        with self._lock:
+            self._stats[name] = data
+            self._fresh[name] = True
 
 
 ########  App-menu data  #######################################################
@@ -613,6 +681,16 @@ def draw_storage_panel(display, canvas, rect, stats):
     canvas.blit(surf, (rect.x, y))
 
 
+def draw_app_panel(display, canvas, rect, stats):
+    """Used in place of draw_storage_panel when viewing a remote puppet
+    (see HealthApp._remote_panels) -- which app it's running is more
+    useful there than its disk usage."""
+    app = stats.get("app")
+    text = f" RUNNING: {app.upper()}" if app else " RUNNING: (NONE ASSIGNED)"
+    surf = display._font.render(text, True, ORANGE)
+    canvas.blit(surf, (rect.x, rect.y))
+
+
 def draw_wifi_panel(display, canvas, rect, stats):
     y = rect.y
     ssid = stats.get("wifi_ssid") or "NOT CONNECTED"
@@ -712,6 +790,8 @@ class HealthApp:
         ]
         self.current_page = 0
         self.hostname = socket.gethostname().upper()
+        self.remote_poller = RemotePoller()
+        self.monitor_target = "LOCAL"  # cycled by Up/Down on the health screen -- "LOCAL" or a PUPPETS name
 
         # App-menu screen state.
         self.selected = 0
@@ -794,11 +874,42 @@ class HealthApp:
             self.draw_power_dialog(canvas)
         self.fb.write_surface(canvas)
 
-    def build_health_canvas(self, canvas):
-        panels = self.pages[self.current_page]
-        self.display.render_page(canvas, panels, self.poller.stats)
+    def _remote_panels(self, page_idx):
+        """Page 2 (WIFI/NETWORK/STORAGE) swaps its STORAGE slot for an APP
+        panel when viewing a remote puppet -- STRINGS doesn't report WiFi
+        stats at all yet (draw_wifi_panel/draw_network_panel already
+        degrade gracefully to their "no signal"/placeholder states
+        against a stats dict missing those keys, so page 2 isn't very
+        informative for a puppet regardless), and knowing which app is
+        running is more useful there than remote disk usage anyway."""
+        panels = self.pages[page_idx]
+        if page_idx != 1:
+            return panels
+        storage_panel = panels[2]
+        app_panel = Panel(storage_panel.col, storage_panel.row, storage_panel.w_chars,
+                           storage_panel.h_chars, "APP", draw_app_panel)
+        return [panels[0], panels[1], app_panel]
 
-        headline = f"{self.hostname} - PAGE {self.current_page + 1}/{len(self.pages)}"
+    def build_health_canvas(self, canvas):
+        if self.monitor_target == "LOCAL":
+            stats, offline = self.poller.stats, False
+            target_label = self.hostname
+            panels = self.pages[self.current_page]
+        else:
+            stats, fresh = self.remote_poller.get(self.monitor_target)
+            offline = not fresh or stats is None
+            target_label = self.monitor_target
+            panels = self._remote_panels(self.current_page)
+
+        if offline:
+            canvas.fill(BLACK)
+            msg = f"{target_label} OFFLINE / UNREACHABLE"
+            msg_surf = self.display._font.render(msg, True, RED)
+            canvas.blit(msg_surf, ((FRAME_W - msg_surf.get_width()) // 2, (FRAME_H - msg_surf.get_height()) // 2))
+        else:
+            self.display.render_page(canvas, panels, stats)
+
+        headline = f"{target_label} - PAGE {self.current_page + 1}/{len(self.pages)}"
         headline_surf = self.display._label_font.render(headline, True, ORANGE)
         row0_y = self.display.char_px(0, 0)[1]
         canvas.blit(headline_surf, ((FRAME_W - headline_surf.get_width()) // 2, row0_y))
@@ -924,6 +1035,12 @@ class HealthApp:
             self.current_page = (self.current_page - 1) % len(self.pages)
         elif code == ecodes.KEY_RIGHT:
             self.current_page = (self.current_page + 1) % len(self.pages)
+        elif code == ecodes.KEY_UP:
+            idx = MONITOR_TARGETS.index(self.monitor_target)
+            self.monitor_target = MONITOR_TARGETS[(idx - 1) % len(MONITOR_TARGETS)]
+        elif code == ecodes.KEY_DOWN:
+            idx = MONITOR_TARGETS.index(self.monitor_target)
+            self.monitor_target = MONITOR_TARGETS[(idx + 1) % len(MONITOR_TARGETS)]
         else:
             return False
         return True
