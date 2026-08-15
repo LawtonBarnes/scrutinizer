@@ -701,12 +701,20 @@ def draw_storage_panel(display, canvas, rect, stats):
 
 def draw_app_panel(display, canvas, rect, stats):
     """Used in place of draw_storage_panel when viewing a remote puppet
-    (see HealthApp._remote_panels) -- which app it's running is more
-    useful there than its disk usage."""
+    (see HealthApp._remote_panels) -- which app it's running, and which
+    of the sibling apps are actually ready to run *there* (real
+    hardware/connectivity, checked on that puppet -- see STRINGS's
+    ReadinessChecker), is more useful there than disk usage."""
     app = stats.get("app")
     text = f" RUNNING: {app.upper()}" if app else " RUNNING: (NONE ASSIGNED)"
     surf = display._font.render(text, True, ORANGE)
     canvas.blit(surf, (rect.x, rect.y))
+
+    hardware = stats.get("hardware") or {}
+    ready = [name.upper() for name, ok in hardware.items() if ok]
+    ready_text = " READY: " + " ".join(ready) if ready else " READY: (NONE)"
+    ready_surf = display._font.render(ready_text, True, ORANGE)
+    canvas.blit(ready_surf, (rect.x, rect.y + display._char_h))
 
 
 def draw_wifi_panel(display, canvas, rect, stats):
