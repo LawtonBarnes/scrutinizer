@@ -59,7 +59,7 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
 import pygame  # noqa: E402  (must come after SDL env vars are set)
 
-VERSION = "2.2"
+VERSION = "2.1"
 
 BASE_DIR = Path(__file__).resolve().parent
 FONT_PATH = BASE_DIR / "VCR_OSD_MONO_1.001.ttf"
@@ -1110,6 +1110,12 @@ class HealthApp:
         self.render()
 
     def _send_identify(self, ip):
+        """Returns (ok, reason) -- reason is only meaningful when not ok.
+        Mirrors assign_to_puppet()'s HTTPError-vs-OSError split (HTTPError
+        is a subclass of OSError, so it must be caught first) -- without
+        this, a real 409 rejection from the puppet read as "UNREACHABLE"
+        even though the puppet responded just fine (caught live when a
+        strings.py bug made every identify assignment 409)."""
         try:
             req = urllib.request.Request(
                 f"http://{ip}:{PUPPET_PORT}/assign",
@@ -1118,9 +1124,11 @@ class HealthApp:
                 method="POST",
             )
             urllib.request.urlopen(req, timeout=1.5)
-            return True
+            return True, None
+        except urllib.error.HTTPError as exc:
+            return False, f"REJECTED ({exc.code})"
         except OSError:
-            return False
+            return False, "UNREACHABLE"
 
     def identify_puppets(self):
         """Broadcasts an assign-to-'identify' command to every puppet
@@ -1130,14 +1138,15 @@ class HealthApp:
         Blocks briefly for the confirmation, same as launch_app()'s
         subprocess.run() already does -- this is a rare, deliberate
         action, not something that needs main-loop-timer integration."""
-        results = [(name, self._send_identify(ip)) for name, ip in PUPPETS]
+        results = [(name, *self._send_identify(ip)) for name, ip in PUPPETS]
 
         canvas = pygame.Surface((FRAME_W, FRAME_H))
         canvas.fill(BLACK)
-        lines = ["IDENTIFY SENT"] + [f"{name}: {'OK' if ok else 'UNREACHABLE'}" for name, ok in results]
+        lines = ["IDENTIFY SENT"] + [f"{name}: {'OK' if ok else reason}" for name, ok, reason in results]
+        oks = [True] + [ok for _name, ok, _reason in results]
         y = self.display._margin_y
-        for line in lines:
-            color = RED if line.endswith("UNREACHABLE") else ORANGE
+        for line, ok in zip(lines, oks):
+            color = ORANGE if ok else RED
             surf = self.display._font.render(line, True, color)
             canvas.blit(surf, ((FRAME_W - surf.get_width()) // 2, y))
             y += self.display._char_h
