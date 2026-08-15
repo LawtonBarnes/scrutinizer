@@ -118,7 +118,13 @@ def find_keyboard_devices():
         if dev.capabilities().get(ecodes.EV_KEY):
             devices.append(dev)
     if not devices:
-        sys.exit("No keyboard input device found (looked for devices with an EV_KEY capability)")
+        # Same headless tolerance as bars.py/loudness.py/channel38.py --
+        # MP is *meant* to always have the remote attached, but rather
+        # than refuse to run at all in the gap before it's plugged in
+        # (or if it's ever briefly unplugged), stay up and show the
+        # dashboard non-interactively. The evdev selector loop below
+        # just has nothing registered and always times out.
+        print("No keyboard input device found -- running non-interactively until one is attached.", file=sys.stderr)
     return devices
 
 
