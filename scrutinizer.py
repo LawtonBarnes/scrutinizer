@@ -423,6 +423,17 @@ APPS = [
     ("4", "CHANNEL 38", "Ole Miss sports ticker", "channel38", "/opt/channel38/channel38.py", check_internet),
 ]
 
+# Not a real local app -- selecting this menu row (handled separately
+# from APPS/launch_app() in _handle_menu_keycode/identify_puppets())
+# broadcasts an assign-to-"identify" command to every puppet's STRINGS,
+# putting each on SMPTE bars + its own hostname overlay so you can
+# match physical CRTs to Pis after the McBrain stack gets moved and
+# recabled. Same fallback bars.py runs by default whenever a puppet has
+# no real assignment at all -- see STRINGS's IDLE_APP.
+IDENTIFY_LABEL = "IDENTIFY PUPPETS"
+IDENTIFY_DESC = "SMPTE BARS + HOSTNAME OVERLAY"
+MENU_ITEM_COUNT = len(APPS) + 1  # the 4 real apps + the IDENTIFY PUPPETS row
+
 VERSION_RE = re.compile(r"""VERSION\s*=\s*['"]([^'"]+)['"]""")
 
 
@@ -923,11 +934,12 @@ class HealthApp:
             0, 0, d._width, box_rows, f"CENTRAL SCRUTINIZER {VERSION}".upper(), subtitle="BY METAL SHOP"))
 
         rows_per_app = 2  # label+version row, description row
-        total_rows = rows_per_app * len(APPS)
+        total_rows = rows_per_app * MENU_ITEM_COUNT
         start_row = 2 + max(0, (box_rows - 3 - total_rows) // 2)
 
         row = start_row
-        for idx, (_key, label, desc, cmd, script_path, _hw_check) in enumerate(APPS):
+        for idx in range(MENU_ITEM_COUNT):
+            is_identify_row = idx == len(APPS)
             selected = idx == self.selected
             text_color = BLACK if selected else ORANGE
             highlight_x, px_y = d.char_px(1, row)
@@ -942,6 +954,16 @@ class HealthApp:
                 pygame.draw.rect(canvas, ORANGE, (
                     highlight_x + HIGHLIGHT_GAP, px_y - 2,
                     highlight_w - 2 * HIGHLIGHT_GAP, d._char_h * 2 + 2))
+
+            if is_identify_row:
+                line = d._font.render(IDENTIFY_LABEL, True, text_color)
+                canvas.blit(line, (px_x, px_y))
+                desc_line = d._font.render(IDENTIFY_DESC, True, text_color)
+                canvas.blit(desc_line, (px_x + d._char_w * 2, px_y + d._char_h))
+                row += rows_per_app
+                continue
+
+            _key, label, desc, cmd, script_path, _hw_check = APPS[idx]
             app_version = read_app_version(script_path)
             line = d._font.render(f"{label} {app_version}".upper(), True, text_color)
             canvas.blit(line, (px_x, px_y))
@@ -1011,6 +1033,43 @@ class HealthApp:
             self.refresh_hardware_status()
         self.render()
 
+    def _send_identify(self, ip):
+        try:
+            req = urllib.request.Request(
+                f"http://{ip}:{PUPPET_PORT}/assign",
+                data=json.dumps({"app": "identify"}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=1.5)
+            return True
+        except OSError:
+            return False
+
+    def identify_puppets(self):
+        """Broadcasts an assign-to-'identify' command to every puppet
+        (see STRINGS's IDLE_APP/LAUNCH_COMMANDS) -- each one switches to
+        SMPTE bars + its own hostname overlay, so physical Pi/CRT
+        pairings can be read straight off the screens after a move.
+        Blocks briefly for the confirmation, same as launch_app()'s
+        subprocess.run() already does -- this is a rare, deliberate
+        action, not something that needs main-loop-timer integration."""
+        results = [(name, self._send_identify(ip)) for name, ip in PUPPETS]
+
+        canvas = pygame.Surface((FRAME_W, FRAME_H))
+        canvas.fill(BLACK)
+        lines = ["IDENTIFY SENT"] + [f"{name}: {'OK' if ok else 'UNREACHABLE'}" for name, ok in results]
+        y = self.display._margin_y
+        for line in lines:
+            color = RED if line.endswith("UNREACHABLE") else ORANGE
+            surf = self.display._font.render(line, True, color)
+            canvas.blit(surf, ((FRAME_W - surf.get_width()) // 2, y))
+            y += self.display._char_h
+        self.fb.write_surface(canvas)
+
+        time.sleep(2)
+        self.render()
+
     def handle_keycode(self, code):
         """Returns True if the app should redraw after this key."""
         if self.power_dialog_active:
@@ -1051,12 +1110,15 @@ class HealthApp:
         elif code == ecodes.KEY_COMPOSE:
             pass  # already at the app menu -- no-op
         elif code == ecodes.KEY_UP:
-            self.selected = (self.selected - 1) % len(APPS)
+            self.selected = (self.selected - 1) % MENU_ITEM_COUNT
         elif code == ecodes.KEY_DOWN:
-            self.selected = (self.selected + 1) % len(APPS)
+            self.selected = (self.selected + 1) % MENU_ITEM_COUNT
         elif code in (ecodes.KEY_ENTER, ecodes.KEY_KPENTER, ecodes.BTN_LEFT, ecodes.BTN_MOUSE):
-            self.launch_app(APPS[self.selected][3])
-            return False  # launch_app() already rendered
+            if self.selected == len(APPS):
+                self.identify_puppets()
+            else:
+                self.launch_app(APPS[self.selected][3])
+            return False  # both already rendered
         else:
             return False
         return True
