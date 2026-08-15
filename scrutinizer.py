@@ -46,6 +46,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
@@ -966,12 +967,11 @@ class HealthApp:
         canvas.fill(BLACK)
         d = self.display
 
+        hardware_status = self._current_hardware_status()
         if self.monitor_target == "LOCAL":
-            hardware_status = self.hardware_status
             title = f"CENTRAL SCRUTINIZER {VERSION}".upper()
         else:
-            stats, fresh = self.remote_poller.get(self.monitor_target)
-            hardware_status = (stats or {}).get("hardware") or {}
+            _stats, fresh = self.remote_poller.get(self.monitor_target)
             title = f"ASSIGN TO {self.monitor_target}{'' if fresh else ' (OFFLINE)'}".upper()
 
         box_rows = d._height  # no footer reserved below the box anymore (2026-08-14) -- box fills the full usable height
@@ -1068,6 +1068,13 @@ class HealthApp:
         result = None
         try:
             result = subprocess.run([cmd])
+        except OSError as exc:
+            # _activate_menu_selection() already checks readiness before
+            # calling this, so this should be unreachable in practice --
+            # kept as a backstop so a launcher that's missing/broken
+            # some other way can never take the whole dashboard down
+            # with it.
+            print(f"Failed to launch {cmd}: {exc}", file=sys.stderr)
         finally:
             self.acquire_console()
             self.drain_stale_events()
@@ -1119,9 +1126,16 @@ class HealthApp:
         """Remote-puppet equivalent of launch_app() -- assigns `cmd` to
         `target` (a PUPPETS name) via its STRINGS /assign endpoint
         instead of launching it locally. Blocks briefly for a
-        confirmation screen, same pattern as identify_puppets()."""
+        confirmation screen, same pattern as identify_puppets().
+        _activate_menu_selection() already checks readiness before ever
+        calling this, using the same data the menu page renders from --
+        this call is the authoritative check, since that cached data
+        could be stale (STRINGS's own /assign independently re-validates
+        and rejects with 409 if the app isn't actually installed there,
+        see strings.py's do_POST -- this is what surfaces that)."""
         ip = dict(PUPPETS)[target]
         ok = False
+        reason = "UNREACHABLE"
         try:
             req = urllib.request.Request(
                 f"http://{ip}:{PUPPET_PORT}/assign",
@@ -1131,12 +1145,14 @@ class HealthApp:
             )
             urllib.request.urlopen(req, timeout=2)
             ok = True
+        except urllib.error.HTTPError as exc:
+            reason = "NOT INSTALLED THERE" if exc.code == 409 else f"REJECTED ({exc.code})"
         except OSError:
-            ok = False
+            reason = "UNREACHABLE"
 
         canvas = pygame.Surface((FRAME_W, FRAME_H))
         canvas.fill(BLACK)
-        lines = [f"{target}: ASSIGN {cmd.upper()}", "OK" if ok else "FAILED -- UNREACHABLE"]
+        lines = [f"{target}: ASSIGN {cmd.upper()}", "OK" if ok else f"FAILED -- {reason}"]
         colors = [ORANGE, ORANGE if ok else RED]
         y = self.display._margin_y
         for line, color in zip(lines, colors):
@@ -1148,15 +1164,49 @@ class HealthApp:
         time.sleep(2)
         self.render()
 
+    def _current_hardware_status(self):
+        """The same hardware-readiness dict the menu page renders from
+        (self.hardware_status for LOCAL, the selected puppet's own
+        STRINGS-reported `hardware` field otherwise) -- factored out so
+        _activate_menu_selection() can check readiness before acting,
+        not just display it."""
+        if self.monitor_target == "LOCAL":
+            return self.hardware_status
+        stats, _fresh = self.remote_poller.get(self.monitor_target)
+        return (stats or {}).get("hardware") or {}
+
+    def _show_not_ready_message(self, cmd):
+        canvas = pygame.Surface((FRAME_W, FRAME_H))
+        canvas.fill(BLACK)
+        where = "HERE" if self.monitor_target == "LOCAL" else f"ON {self.monitor_target}"
+        lines = [f"{cmd.upper()} NOT READY", where]
+        y = self.display._margin_y
+        for line in lines:
+            surf = self.display._font.render(line, True, RED)
+            canvas.blit(surf, ((FRAME_W - surf.get_width()) // 2, y))
+            y += self.display._char_h
+        self.fb.write_surface(canvas)
+        time.sleep(1.5)
+        self.render()
+
     def _activate_menu_selection(self):
         """Enter on the menu page -- IDENTIFY PUPPETS is always a
         fleet-wide broadcast regardless of monitor_target, but a real
         app row acts on whichever machine is currently selected:
-        launches locally for LOCAL, assigns remotely for a puppet."""
+        launches locally for LOCAL, assigns remotely for a puppet.
+        Checks readiness first using the same data the row's own
+        HARDWARE NOT FOUND label came from -- avoids a pointless network
+        round-trip for the common case (a puppet doesn't have the app
+        installed) and gives instant feedback; launch_app()/
+        assign_to_puppet() each still have their own backstop for the
+        cases this cached check could be stale for."""
         if self.selected == len(APPS):
             self.identify_puppets()
             return
         cmd = APPS[self.selected][3]
+        if not self._current_hardware_status().get(cmd, True):
+            self._show_not_ready_message(cmd)
+            return
         if self.monitor_target == "LOCAL":
             self.launch_app(cmd)
         else:
