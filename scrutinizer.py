@@ -991,14 +991,20 @@ class HealthApp:
         row0_y = d.char_px(0, 0)[1]
         canvas.blit(headline_surf, ((FRAME_W - headline_surf.get_width()) // 2, row0_y))
 
-        box_row = 1  # box starts one row down, directly under the headline
-        box_rows = d._height - box_row
+        rows_per_app = 2  # label+version row, description row
+        total_rows = rows_per_app * MENU_ITEM_COUNT
+
+        # box_row leaves one blank row between the headline and the box
+        # (2026-08-15, cosmetic per user request), and box_rows is sized
+        # exactly to the content -- border, all app rows, border -- with
+        # no centering slack, so the first app row sits right under the
+        # title instead of leaving a blank line above it.
+        box_row = 2
+        box_rows = total_rows + 2
         self.display.draw_panel_frame(canvas, Panel(
             0, box_row, d._width, box_rows, title, subtitle="BY METAL SHOP"))
 
-        rows_per_app = 2  # label+version row, description row
-        total_rows = rows_per_app * MENU_ITEM_COUNT
-        start_row = box_row + 2 + max(0, (box_rows - 3 - total_rows) // 2)
+        start_row = box_row + 1
 
         row = start_row
         for idx in range(MENU_ITEM_COUNT):
