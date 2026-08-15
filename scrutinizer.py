@@ -59,7 +59,7 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
 import pygame  # noqa: E402  (must come after SDL env vars are set)
 
-VERSION = "2.3"
+VERSION = "2.4"
 
 BASE_DIR = Path(__file__).resolve().parent
 FONT_PATH = BASE_DIR / "VCR_OSD_MONO_1.001.ttf"
@@ -94,6 +94,24 @@ PUPPETS = [
 ]
 MONITOR_TARGETS = ["LOCAL"] + [name for name, _ip in PUPPETS]
 PUPPET_PORT = 8420
+
+# Keycodes forwarded live to a puppet's running app in control mode (see
+# _enter_control_mode()) -- must match STRINGS's RELAY_KEYS allowlist by
+# name exactly. Deliberately excludes Home/Back/Q/Esc/Power/Compose,
+# which stay local (exit control mode / control SCRUTE itself) rather
+# than being relayed -- those mean "exit this app" in every sibling
+# app's own handle_keycode, so relaying them would kill/restart
+# whatever's running on the puppet instead of just adjusting it.
+CONTROL_RELAY_KEYS = {
+    ecodes.KEY_UP: "KEY_UP",
+    ecodes.KEY_DOWN: "KEY_DOWN",
+    ecodes.KEY_LEFT: "KEY_LEFT",
+    ecodes.KEY_RIGHT: "KEY_RIGHT",
+    ecodes.KEY_ENTER: "KEY_ENTER",
+    ecodes.KEY_KPENTER: "KEY_ENTER",
+    ecodes.KEY_VOLUMEUP: "KEY_VOLUMEUP",
+    ecodes.KEY_VOLUMEDOWN: "KEY_VOLUMEDOWN",
+}
 
 # The app menu is a 3rd page (index 2) of the same health screen, not a
 # separate "screen" mode -- Up/Down means "switch monitored machine" on
@@ -848,6 +866,16 @@ class HealthApp:
         self.pending_power_action = None
         self._rel_accum = {"x": 0, "y": 0}
 
+        # Live remote-control relay state (2026-08-15) -- entered via OK
+        # on a gauge page while monitor_target is a puppet, see
+        # _enter_control_mode(). control_mode_target is separate from
+        # monitor_target (rather than just reusing it) so leaving
+        # control mode can't accidentally leave you mid-relay against
+        # whatever puppet monitor_target happens to have moved to since.
+        self.control_mode_active = False
+        self.control_mode_target = None
+        self.control_mode_last_result = None  # None, "OK", or "UNREACHABLE" -- last relay attempt's outcome
+
         self.kbd_devices = find_keyboard_devices()
         self.selector = selectors.DefaultSelector()
         for dev in self.kbd_devices:
@@ -923,7 +951,10 @@ class HealthApp:
 
     def render(self):
         canvas = pygame.Surface((FRAME_W, FRAME_H))
-        self.build_health_canvas(canvas)  # dispatches to the menu page internally for MENU_PAGE_INDEX
+        if self.control_mode_active:
+            self._build_control_mode_screen(canvas)
+        else:
+            self.build_health_canvas(canvas)  # dispatches to the menu page internally for MENU_PAGE_INDEX
         if self.power_dialog_active:
             self.draw_power_dialog(canvas)
         self.fb.write_surface(canvas)
@@ -1274,6 +1305,8 @@ class HealthApp:
         elif code == ecodes.KEY_POWER:
             self.power_dialog_active = True
             self.power_dialog_selection = 0
+        elif self.control_mode_active:
+            return self._handle_control_mode_keycode(code)
         elif self.current_page == MENU_PAGE_INDEX:
             return self._handle_menu_page_keycode(code)
         else:
@@ -1298,9 +1331,113 @@ class HealthApp:
         elif code == ecodes.KEY_DOWN:
             idx = MONITOR_TARGETS.index(self.monitor_target)
             self.monitor_target = MONITOR_TARGETS[(idx + 1) % len(MONITOR_TARGETS)]
+        elif code in (ecodes.KEY_ENTER, ecodes.KEY_KPENTER) and self.monitor_target != "LOCAL":
+            self._enter_control_mode()
+            return False  # already rendered
         else:
             return False
         return True
+
+    def _enter_control_mode(self):
+        """OK on a gauge page while viewing a puppet -- takes live
+        control of whatever app is currently running there instead of
+        just displaying its stats. Checked for freshness first, same as
+        build_health_canvas's own offline check, so this never enters a
+        mode that can't actually relay anything."""
+        stats, fresh = self.remote_poller.get(self.monitor_target)
+        if not fresh or stats is None:
+            canvas = pygame.Surface((FRAME_W, FRAME_H))
+            canvas.fill(BLACK)
+            msg = f"{self.monitor_target} OFFLINE / UNREACHABLE"
+            msg_surf = self.display._font.render(msg, True, RED)
+            canvas.blit(msg_surf, ((FRAME_W - msg_surf.get_width()) // 2, (FRAME_H - msg_surf.get_height()) // 2))
+            self.fb.write_surface(canvas)
+            time.sleep(1.5)
+            self.render()
+            return
+        self.control_mode_active = True
+        self.control_mode_target = self.monitor_target
+        self.control_mode_last_result = None
+        self.render()
+
+    def _handle_control_mode_keycode(self, code):
+        """Active while control_mode_active -- Up/Down/Left/Right/OK/Vol
+        relay live to control_mode_target's running app (see
+        _send_relay_key). Home/Back exit back to page 0, the hamburger
+        exits straight to the menu page instead -- matches the existing
+        fast-path convention on the gauge pages. Q/Esc/Power are already
+        handled globally in handle_keycode before this is ever reached."""
+        if code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME, ecodes.KEY_BACK):
+            self.control_mode_active = False
+            self.current_page = 0
+        elif code == ecodes.KEY_COMPOSE:
+            self.control_mode_active = False
+            self.current_page = MENU_PAGE_INDEX
+        elif code in CONTROL_RELAY_KEYS:
+            self._send_relay_key(code)
+        else:
+            return False
+        return True
+
+    def _send_relay_key(self, code):
+        """POSTs one keypress to control_mode_target's STRINGS /input --
+        same blocking, short-timeout, HTTPError-vs-OSError shape every
+        other SCRUTE-to-puppet call already uses (see assign_to_puppet).
+        A failed send just updates the on-screen indicator; it doesn't
+        exit control mode, since a single dropped packet on a flaky
+        connection shouldn't kick you out of what could still be a
+        perfectly usable session."""
+        key_name = CONTROL_RELAY_KEYS[code]
+        ip = dict(PUPPETS)[self.control_mode_target]
+        try:
+            req = urllib.request.Request(
+                f"http://{ip}:{PUPPET_PORT}/input",
+                data=json.dumps({"key": key_name}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=1)
+            self.control_mode_last_result = "OK"
+        except (urllib.error.HTTPError, OSError):
+            self.control_mode_last_result = "UNREACHABLE"
+
+    def _build_control_mode_screen(self, canvas):
+        """Dedicated full-screen view for control_mode_active --
+        deliberately NOT an overlay on the normal gauge panels, so it's
+        unambiguous that arrows are now relaying to a puppet's own
+        running app instead of navigating SCRUTE itself (the exact
+        confusion this whole feature exists to fix). Same headline-then-
+        box layout build_health_canvas/_build_menu_page already use, for
+        visual consistency with the rest of the app."""
+        canvas.fill(BLACK)
+        d = self.display
+        stats, fresh = self.remote_poller.get(self.control_mode_target)
+        app_name = (stats or {}).get("app") or "?"
+        target_label = (stats or {}).get("hostname", self.control_mode_target).upper()
+
+        headline = f"CONTROLLING {target_label}"
+        headline_surf = d._label_font.render(headline, True, ORANGE)
+        row0_y = d.char_px(0, 0)[1]
+        canvas.blit(headline_surf, ((FRAME_W - headline_surf.get_width()) // 2, row0_y))
+
+        lines = [f"RUNNING: {app_name.upper()}", "ARROWS / OK / VOL RELAY LIVE", "HOME TO EXIT"]
+        if not fresh:
+            lines.append("TARGET NOT RESPONDING TO STATUS POLLS")
+        if self.control_mode_last_result == "UNREACHABLE":
+            lines.append("LAST SEND FAILED -- UNREACHABLE")
+
+        box_row = 2
+        box_rows = len(lines) + 2
+        self.display.draw_panel_frame(canvas, Panel(
+            0, box_row, d._width, box_rows, "LIVE CONTROL", subtitle="BY METAL SHOP"))
+
+        row = box_row + 1
+        for line in lines:
+            color = RED if "FAILED" in line or "NOT RESPONDING" in line else ORANGE
+            surf = d._font.render(line, True, color)
+            x, y = d.char_px(1, row)
+            canvas.blit(surf, (x, y))
+            row += 1
 
     def _handle_menu_page_keycode(self, code):
         """Page MENU_PAGE_INDEX -- Up/Down here means moving the
