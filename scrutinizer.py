@@ -75,6 +75,7 @@ KD_TEXT = 0x00
 KD_GRAPHICS = 0x01
 
 STATS_REFRESH_SECONDS = 1.0  # health screen: how often to re-poll CPU/WiFi stats
+HARDWARE_REFRESH_SECONDS = 30  # how often to re-poll sibling-app hardware/connectivity checks
 IDLE_POLL_TIMEOUT = 1.0
 IDLE_TIMEOUT_SECONDS = 120  # menu screen: screensaver, hand off to health after 2 idle minutes
 
@@ -1168,6 +1169,7 @@ class HealthApp:
         try:
             self.render()
             last_stats_refresh = time.time()
+            last_hw_refresh = time.time()
             last_input_time = time.time()
             while not self._quit_requested:
                 for key, _ in self.selector.select(timeout=IDLE_POLL_TIMEOUT):
@@ -1205,6 +1207,21 @@ class HealthApp:
                     self.poller.refresh()
                     last_input_time = now
                     self.render()
+
+                # Independent of the screen-specific branch above -- a
+                # hardware/connectivity check (e.g. WEATHERSTAR's
+                # internet-reachability check) that fails once used to
+                # stay "HARDWARE NOT FOUND" forever, since the only
+                # other triggers were startup and returning from a
+                # launched app. Re-polling periodically means a
+                # transient blip self-heals instead of needing a
+                # restart to notice it cleared. Only re-renders on the
+                # menu screen, the only place this is ever shown.
+                if now - last_hw_refresh >= HARDWARE_REFRESH_SECONDS:
+                    self.refresh_hardware_status()
+                    last_hw_refresh = now
+                    if self.screen == "menu":
+                        self.render()
         finally:
             self.fb.close()
             if self.console_graphics_mode:
