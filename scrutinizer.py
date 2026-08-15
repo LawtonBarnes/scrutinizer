@@ -982,24 +982,23 @@ class HealthApp:
             # name, it's compact and already fits the border nicely.
             target_label = (stats or {}).get("hostname", self.monitor_target).upper()
 
-        box_rows = d._height  # no footer reserved below the box anymore (2026-08-14) -- box fills the full usable height
-        self.display.draw_panel_frame(canvas, Panel(
-            0, 0, d._width, box_rows, title, subtitle="BY METAL SHOP"))
-
-        # Same "{TARGET} - PAGE n/m" headline pages 0/1 show, so it's
-        # clear which machine you're controlling here too -- sits in the
-        # first blank content row below the border. No layout
-        # recalculation needed: start_row below already reserves rows
-        # 0-1 regardless of app count, this just uses row 1 of that
-        # existing slack instead of leaving it blank.
+        # Same "{TARGET} - PAGE n/m" headline pages 0/1 show, in the same
+        # top-line position (row 0, above the box) -- keeps the headline
+        # position consistent across all 3 pages instead of nesting it
+        # inside the box like before.
         headline = f"{target_label} - PAGE {self.current_page + 1}/{PAGE_COUNT}"
         headline_surf = d._label_font.render(headline, True, ORANGE)
-        row1_y = d.char_px(0, 1)[1]
-        canvas.blit(headline_surf, ((FRAME_W - headline_surf.get_width()) // 2, row1_y))
+        row0_y = d.char_px(0, 0)[1]
+        canvas.blit(headline_surf, ((FRAME_W - headline_surf.get_width()) // 2, row0_y))
+
+        box_row = 1  # box starts one row down, directly under the headline
+        box_rows = d._height - box_row
+        self.display.draw_panel_frame(canvas, Panel(
+            0, box_row, d._width, box_rows, title, subtitle="BY METAL SHOP"))
 
         rows_per_app = 2  # label+version row, description row
         total_rows = rows_per_app * MENU_ITEM_COUNT
-        start_row = 2 + max(0, (box_rows - 3 - total_rows) // 2)
+        start_row = box_row + 2 + max(0, (box_rows - 3 - total_rows) // 2)
 
         row = start_row
         for idx in range(MENU_ITEM_COUNT):
