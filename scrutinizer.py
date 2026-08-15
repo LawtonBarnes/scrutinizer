@@ -59,7 +59,7 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
 import pygame  # noqa: E402  (must come after SDL env vars are set)
 
-VERSION = "2.2"
+VERSION = "2.3"
 
 BASE_DIR = Path(__file__).resolve().parent
 FONT_PATH = BASE_DIR / "VCR_OSD_MONO_1.001.ttf"
@@ -450,6 +450,11 @@ APPS = [
 # match physical CRTs to Pis after the McBrain stack gets moved and
 # recabled. Same fallback bars.py runs by default whenever a puppet has
 # no real assignment at all -- see STRINGS's IDLE_APP.
+HW_STATUS_LABELS = {
+    "not_installed": "NOT INSTALLED HERE",
+    "hardware_not_found": "HARDWARE NOT FOUND",
+}
+
 IDENTIFY_LABEL = "IDENTIFY PUPPETS"
 IDENTIFY_DESC = "SMPTE BARS + HOSTNAME OVERLAY"
 MENU_ITEM_COUNT = len(APPS) + 1  # the 4 real apps + the IDENTIFY PUPPETS row
@@ -891,17 +896,29 @@ class HealthApp:
         # launched app (see launch_app) rather than on every redraw --
         # these checks shell out / hit the network, so re-running them on
         # every arrow-key press would make navigation feel laggy.
+        #
+        # Status strings, not bools (2026-08-15, matches STRINGS's
+        # ReadinessChecker) -- "not installed on this machine at all"
+        # and "installed but hw_check failed" used to collapse into the
+        # same generic "HARDWARE NOT FOUND," which is both confusing
+        # (WEATHERSTAR/CHANNEL 38's checks are check_internet, not a
+        # device probe) and was wrong on MP specifically: an app that
+        # was never installed there still showed as ready, since this
+        # never checked for the launcher at all.
         status = {}
         for _key, _label, _desc, cmd, _script, hw_check in APPS:
+            if not Path(f"/usr/local/bin/{cmd}").exists():
+                status[cmd] = "not_installed"
+                continue
             if hw_check is None:
-                status[cmd] = True
+                status[cmd] = "ready"
                 continue
             try:
-                status[cmd] = hw_check()
+                status[cmd] = "ready" if hw_check() else "hardware_not_found"
             except Exception:
                 # A broken check should read as "hardware not found," not
                 # take the whole menu down.
-                status[cmd] = False
+                status[cmd] = "hardware_not_found"
         self.hardware_status = status
 
     def render(self):
@@ -1036,8 +1053,9 @@ class HealthApp:
             app_version = read_app_version(script_path)
             line = d._font.render(f"{label} {app_version}".upper(), True, text_color)
             canvas.blit(line, (px_x, px_y))
-            hw_ok = hardware_status.get(cmd, True)
-            desc_text = desc.upper() if hw_ok else "HARDWARE NOT FOUND"
+            hw_status = hardware_status.get(cmd, "ready")
+            hw_ok = hw_status == "ready"
+            desc_text = desc.upper() if hw_ok else HW_STATUS_LABELS.get(hw_status, "HARDWARE NOT FOUND")
             # RED on the normal black background makes the warning stand
             # out; on the selected row's orange highlight it stays BLACK
             # like the rest of that row's text -- red-on-orange is low
@@ -1208,11 +1226,12 @@ class HealthApp:
         stats, _fresh = self.remote_poller.get(self.monitor_target)
         return (stats or {}).get("hardware") or {}
 
-    def _show_not_ready_message(self, cmd):
+    def _show_not_ready_message(self, cmd, hw_status="hardware_not_found"):
         canvas = pygame.Surface((FRAME_W, FRAME_H))
         canvas.fill(BLACK)
         where = "HERE" if self.monitor_target == "LOCAL" else f"ON {self.monitor_target}"
-        lines = [f"{cmd.upper()} NOT READY", where]
+        reason = "NOT INSTALLED" if hw_status == "not_installed" else "NOT READY"
+        lines = [f"{cmd.upper()} {reason}", where]
         y = self.display._margin_y
         for line in lines:
             surf = self.display._font.render(line, True, RED)
@@ -1237,8 +1256,9 @@ class HealthApp:
             self.identify_puppets()
             return
         cmd = APPS[self.selected][3]
-        if not self._current_hardware_status().get(cmd, True):
-            self._show_not_ready_message(cmd)
+        hw_status = self._current_hardware_status().get(cmd, "ready")
+        if hw_status != "ready":
+            self._show_not_ready_message(cmd, hw_status)
             return
         if self.monitor_target == "LOCAL":
             self.launch_app(cmd)
