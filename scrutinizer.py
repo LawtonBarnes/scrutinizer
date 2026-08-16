@@ -1603,7 +1603,7 @@ class HealthApp:
                          color=BLACK if pressed else ORANGE)
 
         draw_box(0, 1, 10, 3, "APPS", "apps")
-        draw_box(30, 1, 10, 3, "NO")  # no keycode identified yet -- never flashes, see CONTROL_BUTTON_IDS
+        draw_box(30, 1, 10, 3, "NOFX")  # no keycode identified yet -- never flashes, see CONTROL_BUTTON_IDS
 
         draw_box(14, 3, 12, 3, CONTROL_DPAD_LABELS["up"], "up")
 
