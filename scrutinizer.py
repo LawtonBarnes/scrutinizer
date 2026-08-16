@@ -91,6 +91,13 @@ PUPPETS = [
     ("P2", "192.168.68.65"),
     ("P3", "192.168.68.68"),
     ("P4", "192.168.68.64"),
+    # production joined the fleet as a real STRINGS-supervised target
+    # 2026-08-16 -- SCRUTE no longer auto-launches there (manual
+    # fallback only), so this is genuinely just another puppet from
+    # MP's perspective now. No other special-casing needed anywhere --
+    # RemotePoller/assign_to_puppet/_send_relay_key are all already
+    # fully generic over PUPPETS.
+    ("PRODUCTION", "192.168.68.71"),
 ]
 MONITOR_TARGETS = ["LOCAL"] + [name for name, _ip in PUPPETS]
 PUPPET_PORT = 8420
@@ -98,10 +105,11 @@ PUPPET_PORT = 8420
 # Keycodes forwarded live to a puppet's running app in control mode (see
 # _enter_control_mode()) -- must match STRINGS's RELAY_KEYS allowlist by
 # name exactly. Deliberately excludes Home/Back/Q/Esc/Power/Compose,
-# which stay local (exit control mode / control SCRUTE itself) rather
-# than being relayed -- those mean "exit this app" in every sibling
-# app's own handle_keycode, so relaying them would kill/restart
-# whatever's running on the puppet instead of just adjusting it.
+# which stay local (exit control mode / open Select Target / control
+# SCRUTE itself) rather than being relayed -- those mean "exit this
+# app" in every sibling app's own handle_keycode, so relaying them
+# would kill/restart whatever's running on the puppet instead of just
+# adjusting it.
 CONTROL_RELAY_KEYS = {
     ecodes.KEY_UP: "KEY_UP",
     ecodes.KEY_DOWN: "KEY_DOWN",
@@ -112,6 +120,13 @@ CONTROL_RELAY_KEYS = {
     ecodes.KEY_VOLUMEUP: "KEY_VOLUMEUP",
     ecodes.KEY_VOLUMEDOWN: "KEY_VOLUMEDOWN",
 }
+
+# On-screen labels for the live-control screen's D-pad boxes (2026-08-16).
+# Plain literal strings for now -- deliberately not per-app yet -- but
+# kept as a lookup dict rather than inlined into the drawing code so a
+# future per-app label system (e.g. sourced from STRINGS's /status) can
+# swap these in later without touching _build_control_mode_screen.
+CONTROL_DPAD_LABELS = {"up": "UP", "down": "DOWN", "left": "LEFT", "right": "RIGHT"}
 
 # The app menu is a 3rd page (index 2) of the same health screen, not a
 # separate "screen" mode -- Up/Down means "switch monitored machine" on
@@ -866,15 +881,20 @@ class HealthApp:
         self.pending_power_action = None
         self._rel_accum = {"x": 0, "y": 0}
 
-        # Live remote-control relay state (2026-08-15) -- entered via OK
-        # on a gauge page while monitor_target is a puppet, see
-        # _enter_control_mode(). control_mode_target is separate from
-        # monitor_target (rather than just reusing it) so leaving
-        # control mode can't accidentally leave you mid-relay against
-        # whatever puppet monitor_target happens to have moved to since.
-        self.control_mode_active = False
+        # Full-screen overlay state (2026-08-15, generalized 2026-08-16).
+        # None / "control" / "target_select" -- which overlay (if any) is
+        # showing instead of the normal gauge/menu pages. Was a single
+        # control_mode_active bool before Select Target needed a second,
+        # independent full-screen mode alongside it -- consolidated into
+        # one flag rather than piling on a second boolean.
+        self.overlay_mode = None
+        # control_mode_target is separate from monitor_target (rather
+        # than just reusing it) so leaving control mode can't
+        # accidentally leave you mid-relay against whatever puppet
+        # monitor_target happens to have moved to since.
         self.control_mode_target = None
         self.control_mode_last_result = None  # None, "OK", or "UNREACHABLE" -- last relay attempt's outcome
+        self.target_selected = 0  # cursor position on the target_select overlay
 
         self.kbd_devices = find_keyboard_devices()
         self.selector = selectors.DefaultSelector()
@@ -951,8 +971,10 @@ class HealthApp:
 
     def render(self):
         canvas = pygame.Surface((FRAME_W, FRAME_H))
-        if self.control_mode_active:
+        if self.overlay_mode == "control":
             self._build_control_mode_screen(canvas)
+        elif self.overlay_mode == "target_select":
+            self._build_target_select_screen(canvas)
         else:
             self.build_health_canvas(canvas)  # dispatches to the menu page internally for MENU_PAGE_INDEX
         if self.power_dialog_active:
@@ -974,6 +996,18 @@ class HealthApp:
         app_panel = Panel(storage_panel.col, storage_panel.row, storage_panel.w_chars,
                            storage_panel.h_chars, "APP", draw_app_panel)
         return [panels[0], panels[1], app_panel]
+
+    def _page_headline(self, target_label):
+        """Remote targets show 'CONTROLLING: <name>' (2026-08-16, once
+        selected via the Select Target overlay) instead of the
+        page-number format LOCAL keeps -- matches the live-control
+        screen's own headline style, so a remote target's whole page
+        sequence reads as one consistent "you are driving this
+        machine" experience rather than switching styles only once you
+        actually launch something."""
+        if self.monitor_target == "LOCAL":
+            return f"{target_label} - PAGE {self.current_page + 1}/{PAGE_COUNT}"
+        return f"CONTROLLING: {target_label}"
 
     def build_health_canvas(self, canvas):
         if self.current_page == MENU_PAGE_INDEX:
@@ -1001,7 +1035,7 @@ class HealthApp:
         else:
             self.display.render_page(canvas, panels, stats)
 
-        headline = f"{target_label} - PAGE {self.current_page + 1}/{PAGE_COUNT}"
+        headline = self._page_headline(target_label)
         headline_surf = self.display._label_font.render(headline, True, ORANGE)
         row0_y = self.display.char_px(0, 0)[1]
         canvas.blit(headline_surf, ((FRAME_W - headline_surf.get_width()) // 2, row0_y))
@@ -1030,11 +1064,11 @@ class HealthApp:
             # name, it's compact and already fits the border nicely.
             target_label = (stats or {}).get("hostname", self.monitor_target).upper()
 
-        # Same "{TARGET} - PAGE n/m" headline pages 0/1 show, in the same
+        # Same headline pages 0/1 show (see _page_headline), in the same
         # top-line position (row 0, above the box) -- keeps the headline
         # position consistent across all 3 pages instead of nesting it
         # inside the box like before.
-        headline = f"{target_label} - PAGE {self.current_page + 1}/{PAGE_COUNT}"
+        headline = self._page_headline(target_label)
         headline_surf = d._label_font.render(headline, True, ORANGE)
         row0_y = d.char_px(0, 0)[1]
         canvas.blit(headline_surf, ((FRAME_W - headline_surf.get_width()) // 2, row0_y))
@@ -1300,12 +1334,26 @@ class HealthApp:
         """Returns True if the app should redraw after this key."""
         if self.power_dialog_active:
             return self.handle_power_dialog_keycode(code)
+        if code == ecodes.KEY_COMPOSE:
+            # TARGET/hamburger is global (2026-08-16) -- always opens
+            # Select Target from any state, including mid-control-mode
+            # (which this implicitly drops out of, since overlay_mode
+            # just gets overwritten). Checked here, once, instead of in
+            # each of the three sub-handlers below, which previously had
+            # three different local meanings for this same key -- see
+            # _build_target_select_screen. The power dialog above stays
+            # modal; TARGET can't interrupt it.
+            self.overlay_mode = "target_select"
+            self.target_selected = MONITOR_TARGETS.index(self.monitor_target)
+            return True
         if code in (ecodes.KEY_Q, ecodes.KEY_ESC):
             self._quit_requested = True
         elif code == ecodes.KEY_POWER:
             self.power_dialog_active = True
             self.power_dialog_selection = 0
-        elif self.control_mode_active:
+        elif self.overlay_mode == "target_select":
+            return self._handle_target_select_keycode(code)
+        elif self.overlay_mode == "control":
             return self._handle_control_mode_keycode(code)
         elif self.current_page == MENU_PAGE_INDEX:
             return self._handle_menu_page_keycode(code)
@@ -1316,10 +1364,10 @@ class HealthApp:
     def _handle_gauge_page_keycode(self, code):
         """Pages 0/1 (CPU/MEM, WIFI/NET) -- Up/Down switches which
         machine's stats are shown (LOCAL/P1-P4); pick the puppet here
-        before paging over to the menu to act on it."""
-        if code == ecodes.KEY_COMPOSE:  # hamburger/Menu button -- jump straight to the menu page
-            self.current_page = MENU_PAGE_INDEX
-        elif code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME, ecodes.KEY_BACK):
+        before paging over to the menu to act on it. TARGET/hamburger is
+        handled globally now, before this is ever reached -- see
+        handle_keycode."""
+        if code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME, ecodes.KEY_BACK):
             self.current_page = 0  # Home always means "page 0" specifically now
         elif code == ecodes.KEY_LEFT:
             self.current_page = (self.current_page - 1) % PAGE_COUNT
@@ -1355,24 +1403,26 @@ class HealthApp:
             time.sleep(1.5)
             self.render()
             return
-        self.control_mode_active = True
+        self.overlay_mode = "control"
         self.control_mode_target = self.monitor_target
         self.control_mode_last_result = None
         self.render()
 
     def _handle_control_mode_keycode(self, code):
-        """Active while control_mode_active -- Up/Down/Left/Right/OK/Vol
-        relay live to control_mode_target's running app (see
-        _send_relay_key). Home/Back exit back to page 0, the hamburger
-        exits straight to the menu page instead -- matches the existing
-        fast-path convention on the gauge pages. Q/Esc/Power are already
-        handled globally in handle_keycode before this is ever reached."""
-        if code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME, ecodes.KEY_BACK):
-            self.control_mode_active = False
-            self.current_page = 0
-        elif code == ecodes.KEY_COMPOSE:
-            self.control_mode_active = False
+        """Active while overlay_mode == "control" -- D-pad/OK/Vol relay
+        live to control_mode_target's running app (see _send_relay_key).
+        House/APPS (2026-08-16) exits back to that same target's app
+        menu -- freed up by TARGET's move to a global hamburger binding
+        (see handle_keycode), so House inherited hamburger's old
+        fast-path job here. BACK exits all the way out to page 0.
+        Q/Esc/Power/TARGET are already handled globally in
+        handle_keycode before this is ever reached."""
+        if code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME):
+            self.overlay_mode = None
             self.current_page = MENU_PAGE_INDEX
+        elif code == ecodes.KEY_BACK:
+            self.overlay_mode = None
+            self.current_page = 0
         elif code in CONTROL_RELAY_KEYS:
             self._send_relay_key(code)
         else:
@@ -1401,42 +1451,132 @@ class HealthApp:
         except (urllib.error.HTTPError, OSError):
             self.control_mode_last_result = "UNREACHABLE"
 
+    def _handle_target_select_keycode(self, code):
+        """Active while overlay_mode == "target_select" -- opened by the
+        global TARGET/hamburger binding (see handle_keycode) from any
+        state. Up/Down moves the cursor over MONITOR_TARGETS, OK picks
+        it (sets monitor_target and jumps straight to that machine's
+        app menu, mirroring _activate_menu_selection's own landing
+        choice), Back/Home just closes the overlay leaving
+        monitor_target/current_page exactly as they were -- a pure
+        cancel, not a navigation action."""
+        if code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME, ecodes.KEY_BACK):
+            self.overlay_mode = None
+        elif code == ecodes.KEY_UP:
+            self.target_selected = (self.target_selected - 1) % len(MONITOR_TARGETS)
+        elif code == ecodes.KEY_DOWN:
+            self.target_selected = (self.target_selected + 1) % len(MONITOR_TARGETS)
+        elif code in (ecodes.KEY_ENTER, ecodes.KEY_KPENTER, ecodes.BTN_LEFT, ecodes.BTN_MOUSE):
+            self.monitor_target = MONITOR_TARGETS[self.target_selected]
+            self.overlay_mode = None
+            self.current_page = MENU_PAGE_INDEX
+        else:
+            return False
+        return True
+
     def _build_control_mode_screen(self, canvas):
-        """Dedicated full-screen view for control_mode_active --
+        """Dedicated full-screen view for overlay_mode == "control" --
         deliberately NOT an overlay on the normal gauge panels, so it's
-        unambiguous that arrows are now relaying to a puppet's own
+        unambiguous that the remote is now relaying to a puppet's own
         running app instead of navigating SCRUTE itself (the exact
-        confusion this whole feature exists to fix). Same headline-then-
-        box layout build_health_canvas/_build_menu_page already use, for
-        visual consistency with the rest of the app."""
+        confusion this whole feature exists to fix).
+
+        Layout matches the physical remote's actual button positions
+        1:1 (built + approved 2026-08-16 from a hand-drawn 40x16 ASCII
+        layout checked against the real remote -- see
+        REMOTE-MENU-LAYOUT.txt / help_screen_preview.png), not the
+        box-per-panel style the other pages use. Grid coordinates below
+        are read straight off that layout."""
         canvas.fill(BLACK)
         d = self.display
         stats, fresh = self.remote_poller.get(self.control_mode_target)
-        app_name = (stats or {}).get("app") or "?"
         target_label = (stats or {}).get("hostname", self.control_mode_target).upper()
 
-        headline = f"CONTROLLING {target_label}"
+        headline = f"CONTROLLING: {target_label}"
         headline_surf = d._label_font.render(headline, True, ORANGE)
         row0_y = d.char_px(0, 0)[1]
         canvas.blit(headline_surf, ((FRAME_W - headline_surf.get_width()) // 2, row0_y))
 
-        lines = [f"RUNNING: {app_name.upper()}", "ARROWS / OK / VOL RELAY LIVE", "HOME TO EXIT"]
-        if not fresh:
-            lines.append("TARGET NOT RESPONDING TO STATUS POLLS")
-        if self.control_mode_last_result == "UNREACHABLE":
-            lines.append("LAST SEND FAILED -- UNREACHABLE")
+        def centered(text, width):
+            pad = width - len(text)
+            left = pad // 2
+            return (" " * left) + text + (" " * (pad - left))
 
+        def draw_box(col, row, w, h, label):
+            d.draw_panel_frame(canvas, Panel(col, row, w, h, title=None))
+            content_row = row + (h - 1) // 2
+            d.draw_text(canvas, col + 1, content_row, centered(label, w - 2))
+
+        draw_box(0, 1, 10, 3, "APPS")
+        draw_box(30, 1, 10, 3, "NO")
+
+        draw_box(14, 3, 12, 3, CONTROL_DPAD_LABELS["up"])
+
+        draw_box(1, 5, 12, 3, CONTROL_DPAD_LABELS["left"])
+        d.draw_text(canvas, 14 + 1, 6, centered("OK", 10))  # deliberately unboxed, user's design choice
+        draw_box(27, 5, 12, 3, CONTROL_DPAD_LABELS["right"])
+
+        draw_box(14, 7, 12, 3, CONTROL_DPAD_LABELS["down"])
+
+        draw_box(0, 9, 10, 3, "TARGET")
+        draw_box(30, 9, 10, 3, "BACK")
+
+        draw_box(0, 12, 10, 3, "MUTE")
+        draw_box(30, 12, 10, 3, "VOL+")
+
+        # Footer slot doubles as the status line -- swapped for a warning
+        # instead of growing the layout with an extra row, since the
+        # 40x16 grid this screen is built against has no spare row below
+        # the MUTE/VOL+ boxes.
+        if not fresh:
+            footer, footer_color = f"{target_label} NOT RESPONDING", RED
+        elif self.control_mode_last_result == "UNREACHABLE":
+            footer, footer_color = "LAST SEND FAILED -- UNREACHABLE", RED
+        else:
+            footer, footer_color = "DEVICE: USB REMOTE", ORANGE
+        footer_surf = d._font.render(footer, True, footer_color)
+        row15_y = d.char_px(0, 15)[1]
+        canvas.blit(footer_surf, ((FRAME_W - footer_surf.get_width()) // 2, row15_y))
+
+    def _build_target_select_screen(self, canvas):
+        """TARGET/hamburger overlay (2026-08-16) -- a flat picker over
+        MONITOR_TARGETS (LOCAL/P1-P4/PRODUCTION), styled like the app
+        menu's box but simpler: one row per machine, no version/hardware
+        columns, since machines don't have those the way apps do.
+        Selecting a row hands off to _handle_target_select_keycode."""
+        canvas.fill(BLACK)
+        d = self.display
+
+        headline_surf = d._label_font.render("SELECT TARGET", True, ORANGE)
+        row0_y = d.char_px(0, 0)[1]
+        canvas.blit(headline_surf, ((FRAME_W - headline_surf.get_width()) // 2, row0_y))
+
+        title = f"CENTRAL SCRUTINIZER {VERSION}".upper()
         box_row = 2
-        box_rows = len(lines) + 2
+        box_rows = len(MONITOR_TARGETS) + 2
         self.display.draw_panel_frame(canvas, Panel(
-            0, box_row, d._width, box_rows, "LIVE CONTROL", subtitle="BY METAL SHOP"))
+            0, box_row, d._width, box_rows, title, subtitle="BY METAL SHOP"))
 
         row = box_row + 1
-        for line in lines:
-            color = RED if "FAILED" in line or "NOT RESPONDING" in line else ORANGE
-            surf = d._font.render(line, True, color)
-            x, y = d.char_px(1, row)
-            canvas.blit(surf, (x, y))
+        for idx, name in enumerate(MONITOR_TARGETS):
+            selected = idx == self.target_selected
+            text_color = BLACK if selected else ORANGE
+            highlight_x, px_y = d.char_px(1, row)
+            px_x = highlight_x + d._char_w
+            if selected:
+                highlight_w = (d._width - 2) * d._char_w
+                HIGHLIGHT_GAP = 4
+                pygame.draw.rect(canvas, ORANGE, (
+                    highlight_x + HIGHLIGHT_GAP, px_y - 2,
+                    highlight_w - 2 * HIGHLIGHT_GAP, d._char_h + 2))
+
+            if name == "LOCAL":
+                label = self.hostname
+            else:
+                stats, _fresh = self.remote_poller.get(name)
+                label = (stats or {}).get("hostname", name).upper()
+            line = d._font.render(label, True, text_color)
+            canvas.blit(line, (px_x, px_y))
             row += 1
 
     def _handle_menu_page_keycode(self, code):
@@ -1447,8 +1587,6 @@ class HealthApp:
         _activate_menu_selection)."""
         if code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME, ecodes.KEY_BACK):
             self.current_page = 0
-        elif code == ecodes.KEY_COMPOSE:
-            pass  # already at the menu page -- no-op
         elif code == ecodes.KEY_LEFT:
             self.current_page = (self.current_page - 1) % PAGE_COUNT
         elif code == ecodes.KEY_RIGHT:
