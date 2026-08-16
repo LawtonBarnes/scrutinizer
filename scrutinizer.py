@@ -140,6 +140,15 @@ PAGE_COUNT = 3
 PUPPET_POLL_TIMEOUT_SECONDS = 2
 PUPPET_POLL_INTERVAL_SECONDS = 3
 
+# The physical remote's OK button fires both KEY_ENTER and BTN_LEFT for
+# one press (separate keyboard/mouse HID interfaces on the same
+# device) -- see _activate_menu_selection for the full story. This
+# debounces the app-menu activation specifically, since that's the one
+# "confirm" action with a real, race-prone side effect (launching a
+# process on a puppet); well under a human's fastest plausible second
+# press, comfortably over the near-simultaneous dual-interface gap.
+MENU_ACTIVATION_DEBOUNCE_SECONDS = 0.5
+
 POWER_OPTIONS = ["NO", "YES", "RESTART"]
 MOUSE_MOVE_THRESHOLD = 12  # cumulative REL_X/REL_Y units before it counts as one direction press
 
@@ -869,10 +878,11 @@ class HealthApp:
         self.current_page = 0
         self.hostname = socket.gethostname().upper()
         self.remote_poller = RemotePoller()
-        self.monitor_target = "LOCAL"  # cycled by Up/Down on the health screen -- "LOCAL" or a PUPPETS name
+        self.monitor_target = "LOCAL"  # set via the Select Target overlay -- "LOCAL" or a PUPPETS name
 
         # App-menu screen state.
         self.selected = 0
+        self._last_activation_time = 0.0  # debounces _activate_menu_selection -- see MENU_ACTIVATION_DEBOUNCE_SECONDS
         self.hardware_status = {}
         self.refresh_hardware_status()
 
@@ -1331,7 +1341,27 @@ class HealthApp:
         round-trip for the common case (a puppet doesn't have the app
         installed) and gives instant feedback; launch_app()/
         assign_to_puppet() each still have their own backstop for the
-        cases this cached check could be stale for."""
+        cases this cached check could be stale for.
+
+        Debounced (2026-08-16) -- the remote's OK button fires both
+        KEY_ENTER (its keyboard HID interface) and BTN_LEFT (its mouse
+        HID interface) for a single physical press, confirmed live via
+        each device's reported EV_KEY capabilities. _handle_menu_page_
+        keycode already treats both as equivalent "confirm" triggers
+        (needed for the remote's air-mouse mode), so one real press was
+        always calling this twice -- harmless before, when it only
+        re-showed the same static confirmation screen, but now that a
+        real app assignment launches an actual process on the puppet,
+        two back-to-back /assign calls race STRINGS's openvt console
+        handoff and crash the just-launched app (confirmed live: exit
+        code 8, "Couldn't deallocate console 1", auto-recovers via
+        STRINGS's own restart within ~3s, but visibly launches-quits-
+        relaunches). A short debounce absorbs the duplicate without
+        being perceptible on a genuine second press."""
+        now = time.time()
+        if now - self._last_activation_time < MENU_ACTIVATION_DEBOUNCE_SECONDS:
+            return
+        self._last_activation_time = now
         if self.selected == len(APPS):
             self.identify_puppets()
             return
