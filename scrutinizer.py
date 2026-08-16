@@ -103,7 +103,7 @@ MONITOR_TARGETS = ["LOCAL"] + [name for name, _ip in PUPPETS]
 PUPPET_PORT = 8420
 
 # Keycodes forwarded live to a puppet's running app in control mode (see
-# _enter_control_mode()) -- must match STRINGS's RELAY_KEYS allowlist by
+# assign_to_puppet()) -- must match STRINGS's RELAY_KEYS allowlist by
 # name exactly. Deliberately excludes Home/Back/Q/Esc/Power/Compose,
 # which stay local (exit control mode / open Select Target / control
 # SCRUTE itself) rather than being relayed -- those mean "exit this
@@ -1241,14 +1241,22 @@ class HealthApp:
     def assign_to_puppet(self, target, cmd):
         """Remote-puppet equivalent of launch_app() -- assigns `cmd` to
         `target` (a PUPPETS name) via its STRINGS /assign endpoint
-        instead of launching it locally. Blocks briefly for a
-        confirmation screen, same pattern as identify_puppets().
-        _activate_menu_selection() already checks readiness before ever
-        calling this, using the same data the menu page renders from --
-        this call is the authoritative check, since that cached data
-        could be stale (STRINGS's own /assign independently re-validates
-        and rejects with 409 if the app isn't actually installed there,
-        see strings.py's do_POST -- this is what surfaces that)."""
+        instead of launching it locally. _activate_menu_selection()
+        already checks readiness before ever calling this, using the
+        same data the menu page renders from -- this call is the
+        authoritative check, since that cached data could be stale
+        (STRINGS's own /assign independently re-validates and rejects
+        with 409 if the app isn't actually installed there, see
+        strings.py's do_POST -- this is what surfaces that).
+
+        On success, goes straight into control mode (2026-08-16) --
+        picking an app is what puts the remote in live control of it,
+        not a separate gesture afterward (that used to be OK on a
+        gauge page; removed, see _handle_gauge_page_keycode). On
+        failure, shows the same blocking confirmation screen as
+        before, same pattern as identify_puppets() -- there's nothing
+        to control if the assignment didn't take, so this is the one
+        remaining case that still needs an explicit message."""
         ip = dict(PUPPETS)[target]
         ok = False
         reason = "UNREACHABLE"
@@ -1266,10 +1274,17 @@ class HealthApp:
         except OSError:
             reason = "UNREACHABLE"
 
+        if ok:
+            self.overlay_mode = "control"
+            self.control_mode_target = target
+            self.control_mode_last_result = None
+            self.render()
+            return
+
         canvas = pygame.Surface((FRAME_W, FRAME_H))
         canvas.fill(BLACK)
-        lines = [f"{target}: ASSIGN {cmd.upper()}", "OK" if ok else f"FAILED -- {reason}"]
-        colors = [ORANGE, ORANGE if ok else RED]
+        lines = [f"{target}: ASSIGN {cmd.upper()}", f"FAILED -- {reason}"]
+        colors = [ORANGE, RED]
         y = self.display._margin_y
         for line, color in zip(lines, colors):
             surf = self.display._font.render(line, True, color)
@@ -1367,41 +1382,20 @@ class HealthApp:
         the exact "confusing fast" behavior Select Target replaced;
         monitor_target is now only ever changed via TARGET/hamburger
         (handled globally, before this is ever reached -- see
-        handle_keycode)."""
+        handle_keycode). OK/Enter no longer does anything on a gauge
+        page either (2026-08-16, removed) -- control mode is entered
+        by picking an app on the menu page now (see
+        _activate_menu_selection/assign_to_puppet), not by a separate
+        gesture on the stats pages."""
         if code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME, ecodes.KEY_BACK):
             self.current_page = 0  # Home always means "page 0" specifically now
         elif code == ecodes.KEY_LEFT:
             self.current_page = (self.current_page - 1) % PAGE_COUNT
         elif code == ecodes.KEY_RIGHT:
             self.current_page = (self.current_page + 1) % PAGE_COUNT
-        elif code in (ecodes.KEY_ENTER, ecodes.KEY_KPENTER) and self.monitor_target != "LOCAL":
-            self._enter_control_mode()
-            return False  # already rendered
         else:
             return False
         return True
-
-    def _enter_control_mode(self):
-        """OK on a gauge page while viewing a puppet -- takes live
-        control of whatever app is currently running there instead of
-        just displaying its stats. Checked for freshness first, same as
-        build_health_canvas's own offline check, so this never enters a
-        mode that can't actually relay anything."""
-        stats, fresh = self.remote_poller.get(self.monitor_target)
-        if not fresh or stats is None:
-            canvas = pygame.Surface((FRAME_W, FRAME_H))
-            canvas.fill(BLACK)
-            msg = f"{self.monitor_target} OFFLINE / UNREACHABLE"
-            msg_surf = self.display._font.render(msg, True, RED)
-            canvas.blit(msg_surf, ((FRAME_W - msg_surf.get_width()) // 2, (FRAME_H - msg_surf.get_height()) // 2))
-            self.fb.write_surface(canvas)
-            time.sleep(1.5)
-            self.render()
-            return
-        self.overlay_mode = "control"
-        self.control_mode_target = self.monitor_target
-        self.control_mode_last_result = None
-        self.render()
 
     def _handle_control_mode_keycode(self, code):
         """Active while overlay_mode == "control" -- D-pad/OK/Vol relay
