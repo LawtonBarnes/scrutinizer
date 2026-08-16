@@ -128,6 +128,34 @@ CONTROL_RELAY_KEYS = {
 # swap these in later without touching _build_control_mode_screen.
 CONTROL_DPAD_LABELS = {"up": "UP", "down": "DOWN", "left": "LEFT", "right": "RIGHT"}
 
+# Maps each keycode handled on the live-control screen to the button-box
+# id _build_control_mode_screen draws it as -- used both to relay/act on
+# the press and to know which box to flash (see _flash_button). "NO"
+# (the remote's air-mouse toggle) has no entry -- its actual keycode,
+# if any, isn't identified yet (see REMOTE-MENU-LAYOUT.txt questions),
+# so it can't flash until that's known.
+CONTROL_BUTTON_IDS = {
+    ecodes.KEY_UP: "up",
+    ecodes.KEY_DOWN: "down",
+    ecodes.KEY_LEFT: "left",
+    ecodes.KEY_RIGHT: "right",
+    ecodes.KEY_ENTER: "ok",
+    ecodes.KEY_KPENTER: "ok",
+    ecodes.KEY_VOLUMEUP: "volup",
+    ecodes.KEY_VOLUMEDOWN: "mute",
+    ecodes.KEY_HOMEPAGE: "apps",
+    ecodes.KEY_HOME: "apps",
+    ecodes.KEY_BACK: "back",
+}
+
+# How long a pressed button's box stays inverted (orange fill, black
+# text) on the live-control screen -- a purely visual "yes, this was
+# received" confirmation for troubleshooting whether input is actually
+# reaching SCRUTE (2026-08-16, user request). Blocks briefly like every
+# other confirmation flash in this file already does (assign_to_puppet,
+# identify_puppets, etc.) -- imperceptible for a single keypress.
+BUTTON_FLASH_SECONDS = 0.15
+
 # The app menu is a 3rd page (index 2) of the same health screen, not a
 # separate "screen" mode -- Up/Down means "switch monitored machine" on
 # the gauge pages (0/1) and "move the menu cursor" on the menu page,
@@ -905,6 +933,7 @@ class HealthApp:
         self.control_mode_target = None
         self.control_mode_last_result = None  # None, "OK", or "UNREACHABLE" -- last relay attempt's outcome
         self.target_selected = 0  # cursor position on the target_select overlay
+        self.last_pressed_button = None  # button-box id currently flashed on the live-control screen, or None
 
         self.kbd_devices = find_keyboard_devices()
         self.selector = selectors.DefaultSelector()
@@ -1387,7 +1416,11 @@ class HealthApp:
             # each of the three sub-handlers below, which previously had
             # three different local meanings for this same key -- see
             # _build_target_select_screen. The power dialog above stays
-            # modal; TARGET can't interrupt it.
+            # modal; TARGET can't interrupt it. Flash TARGET's box first
+            # if we're leaving the live-control screen specifically --
+            # elsewhere there's no button-box UI to flash.
+            if self.overlay_mode == "control":
+                self._flash_button("target")
             self.overlay_mode = "target_select"
             self.target_selected = MONITOR_TARGETS.index(self.monitor_target)
             return True
@@ -1435,18 +1468,42 @@ class HealthApp:
         (see handle_keycode), so House inherited hamburger's old
         fast-path job here. BACK exits all the way out to page 0.
         Q/Esc/Power/TARGET are already handled globally in
-        handle_keycode before this is ever reached."""
+        handle_keycode before this is ever reached. Every branch flashes
+        its own button box first (see _flash_button) -- for the two
+        that exit this screen, that means one frame of the live-control
+        screen with the box inverted, then the transition, same as
+        TARGET's own flash in handle_keycode."""
+        button_id = CONTROL_BUTTON_IDS.get(code)
         if code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME):
+            self._flash_button(button_id)
             self.overlay_mode = None
             self.current_page = MENU_PAGE_INDEX
         elif code == ecodes.KEY_BACK:
+            self._flash_button(button_id)
             self.overlay_mode = None
             self.current_page = 0
         elif code in CONTROL_RELAY_KEYS:
             self._send_relay_key(code)
+            self._flash_button(button_id)
         else:
             return False
         return True
+
+    def _flash_button(self, button_id):
+        """Briefly inverts one of the live-control screen's button
+        boxes (orange fill, black text) to confirm a press was actually
+        received -- see BUTTON_FLASH_SECONDS. Renders once with the
+        flash showing, sleeps, then clears; the caller's own subsequent
+        render() (every handle_keycode call site already does one when
+        a handler returns True) shows the settled, non-flashing state
+        -- same blocking-flash pattern as assign_to_puppet()/
+        identify_puppets() elsewhere in this file."""
+        if button_id is None:
+            return
+        self.last_pressed_button = button_id
+        self.render()
+        time.sleep(BUTTON_FLASH_SECONDS)
+        self.last_pressed_button = None
 
     def _send_relay_key(self, code):
         """POSTs one keypress to control_mode_target's STRINGS /input --
@@ -1521,27 +1578,43 @@ class HealthApp:
             left = pad // 2
             return (" " * left) + text + (" " * (pad - left))
 
-        def draw_box(col, row, w, h, label):
+        def draw_box(col, row, w, h, label, button_id=None):
+            # Pressed box gets a solid orange fill (drawn before the
+            # border/text so they layer on top, same order draw_panel_
+            # frame's title/subtitle already uses) with black text --
+            # same inverted-highlight technique as the selected row on
+            # the app menu / Select Target screens, just applied to a
+            # whole box instead of one row. See _flash_button/
+            # last_pressed_button.
+            pressed = button_id is not None and button_id == self.last_pressed_button
+            if pressed:
+                x, y = d.char_px(col, row)
+                pygame.draw.rect(canvas, ORANGE, (x, y, w * d._char_w, h * d._char_h))
             d.draw_panel_frame(canvas, Panel(col, row, w, h, title=None))
             content_row = row + (h - 1) // 2
-            d.draw_text(canvas, col + 1, content_row, centered(label, w - 2))
+            d.draw_text(canvas, col + 1, content_row, centered(label, w - 2),
+                         color=BLACK if pressed else ORANGE)
 
-        draw_box(0, 1, 10, 3, "APPS")
-        draw_box(30, 1, 10, 3, "NO")
+        draw_box(0, 1, 10, 3, "APPS", "apps")
+        draw_box(30, 1, 10, 3, "NO")  # no keycode identified yet -- never flashes, see CONTROL_BUTTON_IDS
 
-        draw_box(14, 3, 12, 3, CONTROL_DPAD_LABELS["up"])
+        draw_box(14, 3, 12, 3, CONTROL_DPAD_LABELS["up"], "up")
 
-        draw_box(1, 5, 12, 3, CONTROL_DPAD_LABELS["left"])
-        d.draw_text(canvas, 14 + 1, 6, centered("OK", 10))  # deliberately unboxed, user's design choice
-        draw_box(27, 5, 12, 3, CONTROL_DPAD_LABELS["right"])
+        draw_box(1, 5, 12, 3, CONTROL_DPAD_LABELS["left"], "left")
+        ok_pressed = self.last_pressed_button == "ok"
+        if ok_pressed:  # deliberately unboxed (user's design choice) -- flash fills just the text's cell row
+            x, y = d.char_px(14, 6)
+            pygame.draw.rect(canvas, ORANGE, (x, y, 10 * d._char_w, d._char_h))
+        d.draw_text(canvas, 14 + 1, 6, centered("OK", 10), color=BLACK if ok_pressed else ORANGE)
+        draw_box(27, 5, 12, 3, CONTROL_DPAD_LABELS["right"], "right")
 
-        draw_box(14, 7, 12, 3, CONTROL_DPAD_LABELS["down"])
+        draw_box(14, 7, 12, 3, CONTROL_DPAD_LABELS["down"], "down")
 
-        draw_box(0, 9, 10, 3, "TARGET")
-        draw_box(30, 9, 10, 3, "BACK")
+        draw_box(0, 9, 10, 3, "TARGET", "target")
+        draw_box(30, 9, 10, 3, "BACK", "back")
 
-        draw_box(0, 12, 10, 3, "MUTE")
-        draw_box(30, 12, 10, 3, "VOL+")
+        draw_box(0, 12, 10, 3, "MUTE", "mute")
+        draw_box(30, 12, 10, 3, "VOL+", "volup")
 
         # Footer slot doubles as the status line -- swapped for a warning
         # instead of growing the layout with an extra row, since the
