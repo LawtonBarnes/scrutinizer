@@ -1578,18 +1578,25 @@ class HealthApp:
             left = pad // 2
             return (" " * left) + text + (" " * (pad - left))
 
+        # Flash fill sits inset from the box's own border rather than
+        # covering it edge-to-edge -- same FLASH_GAP-from-the-border
+        # technique the app menu / Select Target screens already use for
+        # their selected-row highlight (see HIGHLIGHT_GAP there), just
+        # applied on all 4 sides of a box instead of 2.
+        FLASH_GAP = 4
+
         def draw_box(col, row, w, h, label, button_id=None):
-            # Pressed box gets a solid orange fill (drawn before the
+            # Pressed box gets an inset orange fill (drawn before the
             # border/text so they layer on top, same order draw_panel_
-            # frame's title/subtitle already uses) with black text --
-            # same inverted-highlight technique as the selected row on
-            # the app menu / Select Target screens, just applied to a
-            # whole box instead of one row. See _flash_button/
-            # last_pressed_button.
+            # frame's title/subtitle already uses) with black text.
+            # See _flash_button/last_pressed_button.
             pressed = button_id is not None and button_id == self.last_pressed_button
             if pressed:
                 x, y = d.char_px(col, row)
-                pygame.draw.rect(canvas, ORANGE, (x, y, w * d._char_w, h * d._char_h))
+                box_w, box_h = w * d._char_w, h * d._char_h
+                pygame.draw.rect(canvas, ORANGE, (
+                    x + FLASH_GAP, y + FLASH_GAP,
+                    box_w - 2 * FLASH_GAP, box_h - 2 * FLASH_GAP))
             d.draw_panel_frame(canvas, Panel(col, row, w, h, title=None))
             content_row = row + (h - 1) // 2
             d.draw_text(canvas, col + 1, content_row, centered(label, w - 2),
@@ -1602,9 +1609,10 @@ class HealthApp:
 
         draw_box(1, 5, 12, 3, CONTROL_DPAD_LABELS["left"], "left")
         ok_pressed = self.last_pressed_button == "ok"
-        if ok_pressed:  # deliberately unboxed (user's design choice) -- flash fills just the text's cell row
+        if ok_pressed:  # deliberately unboxed (user's design choice) -- inset fill matches the boxed buttons'
             x, y = d.char_px(14, 6)
-            pygame.draw.rect(canvas, ORANGE, (x, y, 10 * d._char_w, d._char_h))
+            pygame.draw.rect(canvas, ORANGE, (
+                x + FLASH_GAP, y, 10 * d._char_w - 2 * FLASH_GAP, d._char_h))
         d.draw_text(canvas, 14 + 1, 6, centered("OK", 10), color=BLACK if ok_pressed else ORANGE)
         draw_box(27, 5, 12, 3, CONTROL_DPAD_LABELS["right"], "right")
 
