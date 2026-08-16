@@ -1362,23 +1362,18 @@ class HealthApp:
         return True
 
     def _handle_gauge_page_keycode(self, code):
-        """Pages 0/1 (CPU/MEM, WIFI/NET) -- Up/Down switches which
-        machine's stats are shown (LOCAL/P1-P4); pick the puppet here
-        before paging over to the menu to act on it. TARGET/hamburger is
-        handled globally now, before this is ever reached -- see
-        handle_keycode."""
+        """Pages 0/1 (CPU/MEM, WIFI/NET). Up/Down no longer switches
+        which machine is shown here (2026-08-16, removed) -- that was
+        the exact "confusing fast" behavior Select Target replaced;
+        monitor_target is now only ever changed via TARGET/hamburger
+        (handled globally, before this is ever reached -- see
+        handle_keycode)."""
         if code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME, ecodes.KEY_BACK):
             self.current_page = 0  # Home always means "page 0" specifically now
         elif code == ecodes.KEY_LEFT:
             self.current_page = (self.current_page - 1) % PAGE_COUNT
         elif code == ecodes.KEY_RIGHT:
             self.current_page = (self.current_page + 1) % PAGE_COUNT
-        elif code == ecodes.KEY_UP:
-            idx = MONITOR_TARGETS.index(self.monitor_target)
-            self.monitor_target = MONITOR_TARGETS[(idx - 1) % len(MONITOR_TARGETS)]
-        elif code == ecodes.KEY_DOWN:
-            idx = MONITOR_TARGETS.index(self.monitor_target)
-            self.monitor_target = MONITOR_TARGETS[(idx + 1) % len(MONITOR_TARGETS)]
         elif code in (ecodes.KEY_ENTER, ecodes.KEY_KPENTER) and self.monitor_target != "LOCAL":
             self._enter_control_mode()
             return False  # already rendered
