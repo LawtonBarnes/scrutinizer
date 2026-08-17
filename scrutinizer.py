@@ -59,7 +59,7 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
 import pygame  # noqa: E402  (must come after SDL env vars are set)
 
-VERSION = "2.5"
+VERSION = "2.6"
 
 BASE_DIR = Path(__file__).resolve().parent
 FONT_PATH = BASE_DIR / "VCR_OSD_MONO_1.001.ttf"
@@ -111,9 +111,10 @@ PUPPET_PORT = 8420
 # kill/restart whatever's running on the puppet instead of just
 # adjusting it. Power is relayed too (2026-08-17) -- see the dedicated
 # handling in handle_keycode(), which routes it here instead of opening
-# SCRUTE's own local power dialog whenever overlay_mode == "control",
-# so the *target*'s confirm dialog shows on the machine you're actually
-# controlling. This only became safe to relay once every fleet
+# SCRUTE's own local power dialog whenever current_page ==
+# CONTROL_PAGE_INDEX, so the *target*'s confirm dialog shows on the
+# machine you're actually controlling. This only became safe to relay
+# once every fleet
 # machine's logind stopped independently reacting to a raw KEY_POWER
 # event (HandlePowerKey=ignore) -- otherwise the relayed keypress would
 # instantly power off the puppet before its own app dialog ever showed,
@@ -165,15 +166,30 @@ CONTROL_BUTTON_IDS = {
 # etc.) -- imperceptible for a single keypress.
 BUTTON_FLASH_SECONDS = 0.15
 
-# The app menu is a 3rd page (index 2) of the same health screen, not a
-# separate "screen" mode -- Up/Down means "switch monitored machine" on
-# the gauge pages (0/1) and "move the menu cursor" on the menu page,
-# Left/Right always means "change page" regardless of which one you're
-# on. Selecting an app on the menu page acts on whichever machine is
-# currently selected (self.monitor_target): launches locally for LOCAL,
-# assigns remotely via STRINGS for a puppet. 2026-08-15 redesign.
+# Five pages in one Left/Right rotation, all handled by the same
+# current_page int -- gauge pages (0/1), the app menu (2), Select
+# Target (3), and Remote Control Help (4). Select Target and Remote
+# Control Help used to be separate "overlay_mode" full-screen states
+# layered on top of current_page, entered only via the TARGET/hamburger
+# button or right after a successful puppet assignment -- folded into
+# the normal page rotation 2026-08-17 so Left/Right alone can reach
+# them too; TARGET/hamburger and auto-jump-after-assign still work as
+# fast-paths into the same two page indices. Left/Right skips
+# CONTROL_PAGE_INDEX whenever monitor_target is LOCAL (see
+# _cycle_page) -- relaying keypresses to yourself doesn't mean
+# anything, so that page only exists in the rotation once a remote
+# target is actually selected. Up/Down means "move the menu/target
+# cursor" on pages 2/3 and does nothing on the gauge pages (removed
+# 2026-08-16 in favor of TARGET/hamburger, see
+# _handle_gauge_page_keycode). Selecting an app on the menu page acts
+# on whichever machine is currently selected (self.monitor_target):
+# launches locally for LOCAL, assigns remotely via STRINGS for a
+# puppet -- and for a puppet, that assignment is also what puts you in
+# live control of it (see assign_to_puppet).
 MENU_PAGE_INDEX = 2
-PAGE_COUNT = 3
+TARGET_SELECT_PAGE_INDEX = 3
+CONTROL_PAGE_INDEX = 4
+PAGE_COUNT = 5
 PUPPET_POLL_TIMEOUT_SECONDS = 2
 PUPPET_POLL_INTERVAL_SECONDS = 3
 
@@ -427,6 +443,25 @@ class RemotePoller:
         with self._lock:
             return self._stats.get(name), self._fresh.get(name, False)
 
+    def set_app_hint(self, name, app):
+        """Optimistically overwrites the cached 'app' field for `name`
+        right after a successful /assign (see assign_to_puppet) -- the
+        background poll thread only refreshes every
+        PUPPET_POLL_INTERVAL_SECONDS, and even once it does, STRINGS
+        itself only updates its own reported `app` after a launch
+        actually succeeds, so without this the control-mode footer
+        would keep showing whatever was running *before* the new
+        assignment for a few seconds after picking the new app. Gets
+        overwritten again by the next real poll regardless, so a wrong
+        guess (e.g. the launch fails right after) self-heals within one
+        poll interval."""
+        with self._lock:
+            stats = self._stats.get(name)
+            if stats is not None:
+                stats["app"] = app
+            else:
+                self._stats[name] = {"app": app}
+
     def _run(self):
         while True:
             for name, ip in PUPPETS:
@@ -646,12 +681,26 @@ class HealthDisplay:
         title_cols = set(range(TITLE_INDENT, TITLE_INDENT + len(title_text)))
         subtitle_start = panel.w_chars - 1 - len(subtitle_text)
         subtitle_cols = set(range(subtitle_start, panel.w_chars - 1))
-        # bold=True: same interlace-flicker reasoning as draw_bar()'s 2px
-        # border -- these box-drawing glyphs' strokes are only ~1px at
-        # this font size, and synthetic bold is the only way to thicken a
-        # font-rendered glyph (there's no line-width knob like
-        # pygame.draw.rect has). Applies to the title/subtitle text too,
-        # which reads fine.
+        # Border glyphs (corners/BOX_H/BOX_V) stay bold -- confirmed fix
+        # for real interlace flicker on CRT output (these strokes are
+        # only ~1px at this font size; a single-field-thin line visibly
+        # flickers at half the frame rate on an interlaced display, and
+        # synthetic bold is the only way to thicken a font-rendered
+        # glyph, there's no line-width knob like pygame.draw.rect has).
+        # title_text/subtitle_text below are body-font TEXT, not part of
+        # that border-line fix, and used to incidentally ride along on
+        # the same bold=True -- switched to normal 2026-08-17 (confirmed
+        # more legible on real small CRTs than the synthetic-bold
+        # rendering) after a stray-bold bug surfaced from this: _font
+        # and _label_font are the same object, so bold=True here used to
+        # leak into anything that rendered _label_font text directly
+        # afterward without going through draw_text's own bold reset
+        # (caught live: the control-mode headline rendered bold on first
+        # paint, then correctly normal once some later draw_text call
+        # happened to reset it first). Now that neither call below ever
+        # sets bold=True, _font's bold state never gets mutated in this
+        # function at all, so that whole class of leak is moot -- no
+        # explicit reset needed here anymore.
         bottom_row = panel.row + panel.h_chars - 1
         self.draw_text(canvas, panel.col, panel.row, BOX_TL, bold=True, font=self._border_font)
         self.draw_text(canvas, panel.col + panel.w_chars - 1, panel.row, BOX_TR, bold=True, font=self._border_font)
@@ -663,9 +712,9 @@ class HealthDisplay:
             if c not in subtitle_cols:
                 self.draw_text(canvas, panel.col + c, bottom_row, BOX_H, bold=True, font=self._border_font)
         if title_text:
-            self.draw_text(canvas, panel.col + TITLE_INDENT, panel.row, title_text, bold=True)
+            self.draw_text(canvas, panel.col + TITLE_INDENT, panel.row, title_text)
         if subtitle_text:
-            self.draw_text(canvas, panel.col + subtitle_start, bottom_row, subtitle_text, bold=True)
+            self.draw_text(canvas, panel.col + subtitle_start, bottom_row, subtitle_text)
         for r in range(1, panel.h_chars - 1):
             self.draw_text(canvas, panel.col, panel.row + r, BOX_V, bold=True, font=self._border_font)
             self.draw_text(canvas, panel.col + panel.w_chars - 1, panel.row + r, BOX_V, bold=True, font=self._border_font)
@@ -785,24 +834,6 @@ def draw_storage_panel(display, canvas, rect, stats):
     canvas.blit(surf, (rect.x, y))
 
 
-def draw_app_panel(display, canvas, rect, stats):
-    """Used in place of draw_storage_panel when viewing a remote puppet
-    (see HealthApp._remote_panels) -- which app it's running, and which
-    of the sibling apps are actually ready to run *there* (real
-    hardware/connectivity, checked on that puppet -- see STRINGS's
-    ReadinessChecker), is more useful there than disk usage."""
-    app = stats.get("app")
-    text = f" RUNNING: {app.upper()}" if app else " RUNNING: (NONE ASSIGNED)"
-    surf = display._font.render(text, True, ORANGE)
-    canvas.blit(surf, (rect.x, rect.y))
-
-    hardware = stats.get("hardware") or {}
-    ready = [name.upper() for name, ok in hardware.items() if ok]
-    ready_text = " READY: " + " ".join(ready) if ready else " READY: (NONE)"
-    ready_surf = display._font.render(ready_text, True, ORANGE)
-    canvas.blit(ready_surf, (rect.x, rect.y + display._char_h))
-
-
 def draw_wifi_panel(display, canvas, rect, stats):
     y = rect.y
     ssid = stats.get("wifi_ssid") or "NOT CONNECTED"
@@ -870,7 +901,13 @@ class HealthApp:
         # from the display's actual usable grid (not hardcoded) so the
         # dashboard fills the underscanned area regardless of font size/
         # resolution -- one row is reserved at the TOP for the headline
-        # (see build_health_canvas), panels start at row 1 instead of 0.
+        # (see build_health_canvas), and panels start at row 2 (not row
+        # 1) to leave a blank row of breathing room under it (2026-08-17,
+        # matching the same change on the menu/target-select screens --
+        # both pages already had exactly 1 row of unused space at the
+        # bottom with the old top row of 1, so bumping PANEL_TOP_ROW
+        # down by 1 relocates that same slack to the top instead of
+        # growing the page).
         # Stacked (full-width, split-height) rather than side-by-side.
         # All four panels are now sized to their own exact content need
         # (a fixed row count) rather than CPU/WIFI taking "whatever's
@@ -890,15 +927,16 @@ class HealthApp:
         wifi_h = WIFI_CONTENT_ROWS + 2
         net_h = NET_CONTENT_ROWS + 2
         storage_h = STORAGE_CONTENT_ROWS + 2
+        PANEL_TOP_ROW = 2
         self.pages = [
             [
-                Panel(0, 1, w, cpu_h, "CPU", draw_cpu_panel),
-                Panel(0, 1 + cpu_h, w, mem_h, "MEMORY", draw_memory_panel),
+                Panel(0, PANEL_TOP_ROW, w, cpu_h, "CPU", draw_cpu_panel),
+                Panel(0, PANEL_TOP_ROW + cpu_h, w, mem_h, "MEMORY", draw_memory_panel),
             ],
             [
-                Panel(0, 1, w, wifi_h, "WIFI", draw_wifi_panel),
-                Panel(0, 1 + wifi_h, w, net_h, "NETWORK", draw_network_panel),
-                Panel(0, 1 + wifi_h + net_h, w, storage_h, "STORAGE", draw_storage_panel),
+                Panel(0, PANEL_TOP_ROW, w, wifi_h, "WIFI", draw_wifi_panel),
+                Panel(0, PANEL_TOP_ROW + wifi_h, w, net_h, "NETWORK", draw_network_panel),
+                Panel(0, PANEL_TOP_ROW + wifi_h + net_h, w, storage_h, "STORAGE", draw_storage_panel),
             ],
         ]
         self.current_page = 0
@@ -917,20 +955,14 @@ class HealthApp:
         self.pending_power_action = None
         self._rel_accum = {"x": 0, "y": 0}
 
-        # Full-screen overlay state (2026-08-15, generalized 2026-08-16).
-        # None / "control" / "target_select" -- which overlay (if any) is
-        # showing instead of the normal gauge/menu pages. Was a single
-        # control_mode_active bool before Select Target needed a second,
-        # independent full-screen mode alongside it -- consolidated into
-        # one flag rather than piling on a second boolean.
-        self.overlay_mode = None
-        # control_mode_target is separate from monitor_target (rather
-        # than just reusing it) so leaving control mode can't
-        # accidentally leave you mid-relay against whatever puppet
-        # monitor_target happens to have moved to since.
-        self.control_mode_target = None
+        # Select Target and Remote Control Help are just pages 3/4 of
+        # current_page now (2026-08-17, see the comment above
+        # TARGET_SELECT_PAGE_INDEX/CONTROL_PAGE_INDEX) -- no separate
+        # overlay_mode/control_mode_target state needed anymore.
+        # Whichever machine is being relayed to on the control page is
+        # simply self.monitor_target, same as everywhere else.
         self.control_mode_last_result = None  # None, "OK", or "UNREACHABLE" -- last relay attempt's outcome
-        self.target_selected = 0  # cursor position on the target_select overlay
+        self.target_selected = 0  # cursor position on the Select Target page
         self.last_pressed_button = None  # button-box id currently flashed on the live-control screen, or None
 
         self.kbd_devices = find_keyboard_devices()
@@ -1008,9 +1040,9 @@ class HealthApp:
 
     def render(self):
         canvas = pygame.Surface((FRAME_W, FRAME_H))
-        if self.overlay_mode == "control":
+        if self.current_page == CONTROL_PAGE_INDEX:
             self._build_control_mode_screen(canvas)
-        elif self.overlay_mode == "target_select":
+        elif self.current_page == TARGET_SELECT_PAGE_INDEX:
             self._build_target_select_screen(canvas)
         else:
             self.build_health_canvas(canvas)  # dispatches to the menu page internally for MENU_PAGE_INDEX
@@ -1018,32 +1050,14 @@ class HealthApp:
             self.draw_power_dialog(canvas)
         self.fb.write_surface(canvas)
 
-    def _remote_panels(self, page_idx):
-        """Page 2 (WIFI/NETWORK/STORAGE) swaps its STORAGE slot for an APP
-        panel when viewing a remote puppet -- STRINGS doesn't report WiFi
-        stats at all yet (draw_wifi_panel/draw_network_panel already
-        degrade gracefully to their "no signal"/placeholder states
-        against a stats dict missing those keys, so page 2 isn't very
-        informative for a puppet regardless), and knowing which app is
-        running is more useful there than remote disk usage anyway."""
-        panels = self.pages[page_idx]
-        if page_idx != 1:
-            return panels
-        storage_panel = panels[2]
-        app_panel = Panel(storage_panel.col, storage_panel.row, storage_panel.w_chars,
-                           storage_panel.h_chars, "APP", draw_app_panel)
-        return [panels[0], panels[1], app_panel]
-
     def _page_headline(self, target_label):
-        """Remote targets show 'CONTROLLING: <name>' (2026-08-16, once
-        selected via the Select Target overlay) instead of the
-        page-number format LOCAL keeps -- matches the live-control
-        screen's own headline style, so a remote target's whole page
-        sequence reads as one consistent "you are driving this
-        machine" experience rather than switching styles only once you
-        actually launch something."""
-        if self.monitor_target == "LOCAL":
-            return f"{target_label} - PAGE {self.current_page + 1}/{PAGE_COUNT}"
+        """'CONTROLLING: <name>' (2026-08-16, originally just for remote
+        targets once selected via the Select Target overlay; unified
+        2026-08-17 to cover LOCAL too, since MP is itself always "the
+        machine you're driving" the same way a puppet is once
+        selected) -- matches the live-control screen's own headline
+        style, so the whole page sequence reads as one consistent
+        experience regardless of which machine is selected."""
         return f"CONTROLLING: {target_label}"
 
     def build_health_canvas(self, canvas):
@@ -1062,7 +1076,7 @@ class HealthApp:
             # only available once we've actually heard from it at least
             # once, so fall back to the short name until then/if offline.
             target_label = (stats or {}).get("hostname", self.monitor_target).upper()
-            panels = self._remote_panels(self.current_page)
+            panels = self.pages[self.current_page]
 
         if offline:
             canvas.fill(BLACK)
@@ -1111,19 +1125,22 @@ class HealthApp:
         canvas.blit(headline_surf, ((FRAME_W - headline_surf.get_width()) // 2, row0_y))
 
         rows_per_app = 2  # label+version row, description row
-        total_rows = rows_per_app * len(APPS)
 
         # box_row leaves one blank row between the headline and the box
-        # (2026-08-15, cosmetic per user request), and box_rows is sized
-        # exactly to the content -- border, all app rows, border -- with
-        # no centering slack, so the first app row sits right under the
-        # title instead of leaving a blank line above it.
+        # (2026-08-15, cosmetic per user request). box_rows now fills
+        # the rest of the screen (2026-08-17, reverting the earlier
+        # exact-fit sizing per user request) so "BY METAL SHOP" sits at
+        # the bottom of the available space instead of right under the
+        # last app row -- gives the box some breathing room instead of
+        # shrink-wrapping to content. start_row leaves one further blank
+        # row inside the box, under the title, before the first app row
+        # (2026-08-17, same request).
         box_row = 2
-        box_rows = total_rows + 2
+        box_rows = d._height - box_row
         self.display.draw_panel_frame(canvas, Panel(
             0, box_row, d._width, box_rows, title, subtitle="BY METAL SHOP"))
 
-        start_row = box_row + 1
+        start_row = box_row + 2
 
         row = start_row
         for idx in range(len(APPS)):
@@ -1257,8 +1274,8 @@ class HealthApp:
             reason = "UNREACHABLE"
 
         if ok:
-            self.overlay_mode = "control"
-            self.control_mode_target = target
+            self.remote_poller.set_app_hint(target, cmd)
+            self.current_page = CONTROL_PAGE_INDEX
             self.control_mode_last_result = None
             self.render()
             return
@@ -1348,36 +1365,42 @@ class HealthApp:
         if self.power_dialog_active:
             return self.handle_power_dialog_keycode(code)
         if code == ecodes.KEY_COMPOSE:
-            # TARGET/hamburger is global (2026-08-16) -- always opens
-            # Select Target from any state, including mid-control-mode
-            # (which this implicitly drops out of, since overlay_mode
-            # just gets overwritten). Checked here, once, instead of in
-            # each of the three sub-handlers below, which previously had
-            # three different local meanings for this same key -- see
-            # _build_target_select_screen. The power dialog above stays
-            # modal; TARGET can't interrupt it. Flash TARGET's box first
-            # if we're leaving the live-control screen specifically --
-            # elsewhere there's no button-box UI to flash.
-            if self.overlay_mode == "control":
+            # TARGET/hamburger is global (2026-08-16) -- always jumps
+            # straight to the Select Target page from any state,
+            # including mid-control (this implicitly drops out of it,
+            # since current_page just gets overwritten). Checked here,
+            # once, instead of in each sub-handler below, which
+            # previously had three different local meanings for this
+            # same key -- see _build_target_select_screen. The power
+            # dialog above stays modal; TARGET can't interrupt it. Flash
+            # TARGET's box first if we're leaving the live-control
+            # screen specifically -- elsewhere there's no button-box UI
+            # to flash.
+            if self.current_page == CONTROL_PAGE_INDEX:
                 self._flash_button("target")
-            self.overlay_mode = "target_select"
+            self.current_page = TARGET_SELECT_PAGE_INDEX
             self.target_selected = MONITOR_TARGETS.index(self.monitor_target)
             return True
         if code in (ecodes.KEY_Q, ecodes.KEY_ESC):
             self._quit_requested = True
-        elif code == ecodes.KEY_POWER and self.overlay_mode != "control":
-            # Only opens SCRUTE's own local dialog outside control mode --
-            # while controlling a remote target, Power falls through to
-            # the overlay_mode == "control" branch below instead, which
-            # relays it (now in CONTROL_RELAY_KEYS) so the *target*'s own
-            # confirm dialog shows on the machine actually being
-            # controlled, not on MP. See CONTROL_RELAY_KEYS's comment
-            # for why this needed HandlePowerKey=ignore fleet-wide first.
+        elif code == ecodes.KEY_POWER and self.current_page != CONTROL_PAGE_INDEX:
+            # Only opens SCRUTE's own local dialog outside the control
+            # page -- while controlling a remote target, Power falls
+            # through to the CONTROL_PAGE_INDEX branch below instead,
+            # which relays it (now in CONTROL_RELAY_KEYS) so the
+            # *target*'s own confirm dialog shows on the machine
+            # actually being controlled, not on MP. See
+            # CONTROL_RELAY_KEYS's comment for why this needed
+            # HandlePowerKey=ignore fleet-wide first.
             self.power_dialog_active = True
             self.power_dialog_selection = 0
-        elif self.overlay_mode == "target_select":
+        elif code == ecodes.KEY_LEFT and self.current_page != CONTROL_PAGE_INDEX:
+            self._cycle_page(-1)
+        elif code == ecodes.KEY_RIGHT and self.current_page != CONTROL_PAGE_INDEX:
+            self._cycle_page(1)
+        elif self.current_page == TARGET_SELECT_PAGE_INDEX:
             return self._handle_target_select_keycode(code)
-        elif self.overlay_mode == "control":
+        elif self.current_page == CONTROL_PAGE_INDEX:
             return self._handle_control_mode_keycode(code)
         elif self.current_page == MENU_PAGE_INDEX:
             return self._handle_menu_page_keycode(code)
@@ -1385,52 +1408,84 @@ class HealthApp:
             return self._handle_gauge_page_keycode(code)
         return True
 
+    def _cycle_page(self, direction):
+        """Left/Right, handled globally for pages 0-3 (2026-08-17 --
+        previously each per-page handler had its own identical copy of
+        this, before Select Target/Remote Control Help joined the
+        normal rotation). NOT called at all while on CONTROL_PAGE_INDEX
+        -- handle_keycode only routes Left/Right here when current_page
+        != CONTROL_PAGE_INDEX, since Left/Right are also two of the
+        keys CONTROL_RELAY_KEYS forwards to the target app there (e.g.
+        BARS's pattern cycling) -- paging away instead of relaying
+        would silently break that. Skips CONTROL_PAGE_INDEX whenever
+        monitor_target is LOCAL -- relaying keypresses to yourself
+        doesn't mean anything, so that page only exists in the rotation
+        once a remote target is actually selected (see the comment
+        above TARGET_SELECT_PAGE_INDEX). Resets control_mode_last_result
+        on a fresh landing on the control page so a stale UNREACHABLE
+        from a previous visit doesn't linger -- and re-syncs
+        target_selected to whatever monitor_target actually is on a
+        fresh landing on the target-select page, matching what the
+        TARGET/hamburger fast-path already does (2026-08-17 fix --
+        paging here with Left/Right used to leave the cursor wherever
+        it was last left, possibly stale/not matching the real current
+        target)."""
+        page = self.current_page
+        for _ in range(PAGE_COUNT):
+            page = (page + direction) % PAGE_COUNT
+            if page == CONTROL_PAGE_INDEX and self.monitor_target == "LOCAL":
+                continue
+            break
+        if page == CONTROL_PAGE_INDEX and self.current_page != CONTROL_PAGE_INDEX:
+            self.control_mode_last_result = None
+        elif page == TARGET_SELECT_PAGE_INDEX and self.current_page != TARGET_SELECT_PAGE_INDEX:
+            self.target_selected = MONITOR_TARGETS.index(self.monitor_target)
+        self.current_page = page
+
     def _handle_gauge_page_keycode(self, code):
-        """Pages 0/1 (CPU/MEM, WIFI/NET). Up/Down no longer switches
-        which machine is shown here (2026-08-16, removed) -- that was
-        the exact "confusing fast" behavior Select Target replaced;
-        monitor_target is now only ever changed via TARGET/hamburger
-        (handled globally, before this is ever reached -- see
-        handle_keycode). OK/Enter no longer does anything on a gauge
-        page either (2026-08-16, removed) -- control mode is entered
-        by picking an app on the menu page now (see
+        """Pages 0/1 (CPU/MEM, WIFI/NET). Left/Right is handled globally
+        now (see _cycle_page), before this is ever reached. Up/Down no
+        longer switches which machine is shown here (2026-08-16,
+        removed) -- that was the exact "confusing fast" behavior Select
+        Target replaced; monitor_target is now only ever changed via
+        TARGET/hamburger or the Select Target page (also handled
+        globally/via current_page, before this is ever reached). OK/
+        Enter no longer does anything on a gauge page either
+        (2026-08-16, removed) -- control mode is entered by picking an
+        app on the menu page now (see
         _activate_menu_selection/assign_to_puppet), not by a separate
         gesture on the stats pages."""
         if code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME, ecodes.KEY_BACK):
             self.current_page = 0  # Home always means "page 0" specifically now
-        elif code == ecodes.KEY_LEFT:
-            self.current_page = (self.current_page - 1) % PAGE_COUNT
-        elif code == ecodes.KEY_RIGHT:
-            self.current_page = (self.current_page + 1) % PAGE_COUNT
         else:
             return False
         return True
 
     def _handle_control_mode_keycode(self, code):
-        """Active while overlay_mode == "control" -- D-pad/OK/Vol relay
-        live to control_mode_target's running app (see _send_relay_key).
-        House/APPS (2026-08-16) exits back to that same target's app
-        menu -- freed up by TARGET's move to a global hamburger binding
-        (see handle_keycode), so House inherited hamburger's old
-        fast-path job here. BACK exits all the way out to page 0.
-        Q/Esc/TARGET are already handled globally in handle_keycode
-        before this is ever reached. Power (2026-08-17) is deliberately
-        NOT handled globally while in control mode -- handle_keycode's
-        own KEY_POWER branch is skipped here on purpose so it falls
-        through to the CONTROL_RELAY_KEYS branch below like any other
-        relayed key. Every branch flashes
-        its own button box first (see _flash_button) -- for the two
-        that exit this screen, that means one frame of the live-control
-        screen with the box inverted, then the transition, same as
-        TARGET's own flash in handle_keycode."""
+        """Active on CONTROL_PAGE_INDEX -- D-pad/OK/Vol/Power relay live
+        to monitor_target's running app (see _send_relay_key). House/
+        APPS (2026-08-16) exits to that same target's app menu -- freed
+        up by TARGET's move to a global hamburger binding (see
+        handle_keycode), so House inherited hamburger's old fast-path
+        job here. BACK exits all the way out to page 0. Q/Esc/TARGET/
+        Left/Right are already handled globally in handle_keycode
+        before this is ever reached -- Left/Right leaving this page is
+        exactly what ends the relay (see _cycle_page), no separate
+        "stop controlling" gesture needed. Power (2026-08-17) is
+        deliberately NOT handled globally while on this page --
+        handle_keycode's own KEY_POWER branch is skipped here on
+        purpose so it falls through to the CONTROL_RELAY_KEYS branch
+        below like any other relayed key. Every branch flashes its own
+        button box first (see _flash_button) -- for the two that exit
+        this screen, that means one frame of the live-control screen
+        with the box inverted, then the transition, same as TARGET's
+        own flash in handle_keycode."""
         button_id = CONTROL_BUTTON_IDS.get(code)
         if code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME):
             self._flash_button(button_id)
-            self.overlay_mode = None
             self.current_page = MENU_PAGE_INDEX
         elif code == ecodes.KEY_BACK:
             self._flash_button(button_id)
-            self.overlay_mode = None
             self.current_page = 0
         elif code in CONTROL_RELAY_KEYS:
             self._send_relay_key(code)
@@ -1456,15 +1511,15 @@ class HealthApp:
         self.last_pressed_button = None
 
     def _send_relay_key(self, code):
-        """POSTs one keypress to control_mode_target's STRINGS /input --
-        same blocking, short-timeout, HTTPError-vs-OSError shape every
-        other SCRUTE-to-puppet call already uses (see assign_to_puppet).
-        A failed send just updates the on-screen indicator; it doesn't
-        exit control mode, since a single dropped packet on a flaky
+        """POSTs one keypress to monitor_target's STRINGS /input -- same
+        blocking, short-timeout, HTTPError-vs-OSError shape every other
+        SCRUTE-to-puppet call already uses (see assign_to_puppet). A
+        failed send just updates the on-screen indicator; it doesn't
+        exit the control page, since a single dropped packet on a flaky
         connection shouldn't kick you out of what could still be a
         perfectly usable session."""
         key_name = CONTROL_RELAY_KEYS[code]
-        ip = dict(PUPPETS)[self.control_mode_target]
+        ip = dict(PUPPETS)[self.monitor_target]
         try:
             req = urllib.request.Request(
                 f"http://{ip}:{PUPPET_PORT}/input",
@@ -1478,34 +1533,40 @@ class HealthApp:
             self.control_mode_last_result = "UNREACHABLE"
 
     def _handle_target_select_keycode(self, code):
-        """Active while overlay_mode == "target_select" -- opened by the
-        global TARGET/hamburger binding (see handle_keycode) from any
-        state. Up/Down moves the cursor over MONITOR_TARGETS, OK picks
-        it (sets monitor_target and jumps straight to that machine's
-        app menu, mirroring _activate_menu_selection's own landing
-        choice), Back/Home just closes the overlay leaving
-        monitor_target/current_page exactly as they were -- a pure
-        cancel, not a navigation action."""
+        """Active on TARGET_SELECT_PAGE_INDEX -- reachable by paging
+        there with Left/Right same as any other page, or jumped to
+        directly via the global TARGET/hamburger binding (see
+        handle_keycode) from any state. Up/Down moves the cursor over
+        MONITOR_TARGETS, OK picks it (sets monitor_target and jumps
+        straight to that machine's app menu, mirroring
+        _activate_menu_selection's own landing choice). Back/Home goes
+        to page 0, same as every other page's Home/Back (2026-08-17 --
+        used to be a pure cancel back to whatever page you'd come from,
+        but that "remember the previous page" state doesn't have a
+        natural home now that this is a real page in the rotation
+        rather than an overlay on top of one)."""
         if code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME, ecodes.KEY_BACK):
-            self.overlay_mode = None
+            self.current_page = 0
         elif code == ecodes.KEY_UP:
             self.target_selected = (self.target_selected - 1) % len(MONITOR_TARGETS)
         elif code == ecodes.KEY_DOWN:
             self.target_selected = (self.target_selected + 1) % len(MONITOR_TARGETS)
         elif code in (ecodes.KEY_ENTER, ecodes.KEY_KPENTER, ecodes.BTN_LEFT, ecodes.BTN_MOUSE):
             self.monitor_target = MONITOR_TARGETS[self.target_selected]
-            self.overlay_mode = None
             self.current_page = MENU_PAGE_INDEX
         else:
             return False
         return True
 
     def _build_control_mode_screen(self, canvas):
-        """Dedicated full-screen view for overlay_mode == "control" --
-        deliberately NOT an overlay on the normal gauge panels, so it's
-        unambiguous that the remote is now relaying to a puppet's own
-        running app instead of navigating SCRUTE itself (the exact
-        confusion this whole feature exists to fix).
+        """Dedicated full-screen view for CONTROL_PAGE_INDEX --
+        deliberately not a box-per-panel style page like the others, so
+        it's unambiguous that the remote is now relaying to a puppet's
+        own running app instead of navigating SCRUTE itself (the exact
+        confusion this whole feature exists to fix). Always shows
+        monitor_target -- Left/Right skips this page entirely whenever
+        that's LOCAL (see _cycle_page), so it's always a real puppet by
+        the time this renders.
 
         Layout matches the physical remote's actual button positions
         1:1 (built + approved 2026-08-16 from a hand-drawn 40x16 ASCII
@@ -1515,8 +1576,8 @@ class HealthApp:
         are read straight off that layout."""
         canvas.fill(BLACK)
         d = self.display
-        stats, fresh = self.remote_poller.get(self.control_mode_target)
-        target_label = (stats or {}).get("hostname", self.control_mode_target).upper()
+        stats, fresh = self.remote_poller.get(self.monitor_target)
+        target_label = (stats or {}).get("hostname", self.monitor_target).upper()
 
         headline = f"CONTROLLING: {target_label}"
         headline_surf = d._label_font.render(headline, True, ORANGE)
@@ -1528,12 +1589,21 @@ class HealthApp:
             left = pad // 2
             return (" " * left) + text + (" " * (pad - left))
 
-        # Flash fill sits inset from the box's own border rather than
-        # covering it edge-to-edge -- same FLASH_GAP-from-the-border
-        # technique the app menu / Select Target screens already use for
-        # their selected-row highlight (see HIGHLIGHT_GAP there), just
-        # applied on all 4 sides of a box instead of 2.
-        FLASH_GAP = 4
+        # Flash fill for a *bordered* box sits inside the border's own
+        # content rect (same rect draw_panel_frame itself returns --
+        # one full char cell in from each edge, so the fill never
+        # touches the border ring's cells at all) plus a further
+        # BOX_FLASH_GAP px, so there's genuine black space visible
+        # between the fill and the border rather than the two abutting
+        # (2026-08-17 -- the original small FLASH_GAP inset from the
+        # box's outer pixel edge, not the border's own cell, left the
+        # fill overlapping most of the border ring, so a "pressed" box
+        # just read as solid-orange-with-no-visible-border on the real
+        # CRT). OK's own flash below is unboxed and keeps the old,
+        # smaller OK_FLASH_GAP -- there's no border there to get lost
+        # against.
+        BOX_FLASH_GAP = 3
+        OK_FLASH_GAP = 4
 
         def draw_box(col, row, w, h, label, button_id=None):
             # Pressed box gets an inset orange fill (drawn before the
@@ -1543,10 +1613,11 @@ class HealthApp:
             pressed = button_id is not None and button_id == self.last_pressed_button
             if pressed:
                 x, y = d.char_px(col, row)
-                box_w, box_h = w * d._char_w, h * d._char_h
-                pygame.draw.rect(canvas, ORANGE, (
-                    x + FLASH_GAP, y + FLASH_GAP,
-                    box_w - 2 * FLASH_GAP, box_h - 2 * FLASH_GAP))
+                fill_x = x + d._char_w + BOX_FLASH_GAP
+                fill_y = y + d._char_h + BOX_FLASH_GAP
+                fill_w = (w - 2) * d._char_w - 2 * BOX_FLASH_GAP
+                fill_h = (h - 2) * d._char_h - 2 * BOX_FLASH_GAP
+                pygame.draw.rect(canvas, ORANGE, (fill_x, fill_y, fill_w, fill_h))
             d.draw_panel_frame(canvas, Panel(col, row, w, h, title=None))
             content_row = row + (h - 1) // 2
             d.draw_text(canvas, col + 1, content_row, centered(label, w - 2),
@@ -1562,7 +1633,7 @@ class HealthApp:
         if ok_pressed:  # deliberately unboxed (user's design choice) -- inset fill matches the boxed buttons'
             x, y = d.char_px(14, 6)
             pygame.draw.rect(canvas, ORANGE, (
-                x + FLASH_GAP, y, 10 * d._char_w - 2 * FLASH_GAP, d._char_h))
+                x + OK_FLASH_GAP, y, 10 * d._char_w - 2 * OK_FLASH_GAP, d._char_h))
         d.draw_text(canvas, 14 + 1, 6, centered("OK", 10), color=BLACK if ok_pressed else ORANGE)
         draw_box(27, 5, 12, 3, CONTROL_DPAD_LABELS["right"], "right")
 
@@ -1583,7 +1654,15 @@ class HealthApp:
         elif self.control_mode_last_result == "UNREACHABLE":
             footer, footer_color = "LAST SEND FAILED -- UNREACHABLE", RED
         else:
-            footer, footer_color = "DEVICE: USB REMOTE", ORANGE
+            app_cmd = (stats or {}).get("app")
+            if app_cmd:
+                app_label = next(
+                    (label for _key, label, _desc, cmd, *_ in APPS if cmd == app_cmd),
+                    app_cmd.upper(),
+                )
+            else:
+                app_label = "NONE"
+            footer, footer_color = f"RUNNING: {app_label}", ORANGE
         footer_surf = d._font.render(footer, True, footer_color)
         row15_y = d.char_px(0, 15)[1]
         canvas.blit(footer_surf, ((FRAME_W - footer_surf.get_width()) // 2, row15_y))
@@ -1603,11 +1682,15 @@ class HealthApp:
 
         title = f"CENTRAL SCRUTINIZER {VERSION}".upper()
         box_row = 2
-        box_rows = len(MONITOR_TARGETS) + 2
+        # Fills the rest of the screen and leaves a blank row under the
+        # title before the first row -- same 2026-08-17 change as
+        # _build_menu_page, for the same "give it some breathing room"
+        # request.
+        box_rows = d._height - box_row
         self.display.draw_panel_frame(canvas, Panel(
             0, box_row, d._width, box_rows, title, subtitle="BY METAL SHOP"))
 
-        row = box_row + 1
+        row = box_row + 2
         for idx, name in enumerate(MONITOR_TARGETS):
             selected = idx == self.target_selected
             text_color = BLACK if selected else ORANGE
@@ -1630,17 +1713,15 @@ class HealthApp:
             row += 1
 
     def _handle_menu_page_keycode(self, code):
-        """Page MENU_PAGE_INDEX -- Up/Down here means moving the
-        selection cursor instead of switching puppets (that's done from
-        pages 0/1 before paging over here); Enter activates the
+        """Page MENU_PAGE_INDEX -- Left/Right is handled globally now
+        (see _cycle_page), before this is ever reached. Up/Down here
+        means moving the app-selection cursor; monitor_target (which
+        machine this menu acts on) is changed via TARGET/hamburger or
+        the Select Target page, not from here. Enter activates the
         highlighted row against monitor_target (see
         _activate_menu_selection)."""
         if code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME, ecodes.KEY_BACK):
             self.current_page = 0
-        elif code == ecodes.KEY_LEFT:
-            self.current_page = (self.current_page - 1) % PAGE_COUNT
-        elif code == ecodes.KEY_RIGHT:
-            self.current_page = (self.current_page + 1) % PAGE_COUNT
         elif code == ecodes.KEY_UP:
             self.selected = (self.selected - 1) % len(APPS)
         elif code == ecodes.KEY_DOWN:
