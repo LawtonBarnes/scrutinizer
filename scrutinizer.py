@@ -162,7 +162,7 @@ CONTROL_BUTTON_IDS = {
 # received" confirmation for troubleshooting whether input is actually
 # reaching SCRUTE (2026-08-16, user request). Blocks briefly like every
 # other confirmation flash in this file already does (assign_to_puppet,
-# identify_puppets, etc.) -- imperceptible for a single keypress.
+# etc.) -- imperceptible for a single keypress.
 BUTTON_FLASH_SECONDS = 0.15
 
 # The app menu is a 3rd page (index 2) of the same health screen, not a
@@ -522,21 +522,10 @@ APPS = [
     ("4", "CHANNEL 38", "Ole Miss sports ticker", "channel38", "/opt/channel38/channel38.py", check_internet),
 ]
 
-# Not a real local app -- selecting this menu row (handled separately
-# from APPS/launch_app() in _handle_menu_keycode/identify_puppets())
-# broadcasts an assign-to-"identify" command to every puppet's STRINGS,
-# putting each on SMPTE bars + its own hostname overlay so you can
-# match physical CRTs to Pis after the McBrain stack gets moved and
-# recabled. Same fallback bars.py runs by default whenever a puppet has
-# no real assignment at all -- see STRINGS's IDLE_APP.
 HW_STATUS_LABELS = {
     "not_installed": "NOT INSTALLED HERE",
     "hardware_not_found": "HARDWARE NOT FOUND",
 }
-
-IDENTIFY_LABEL = "IDENTIFY PUPPETS"
-IDENTIFY_DESC = "SMPTE BARS + HOSTNAME OVERLAY"
-MENU_ITEM_COUNT = len(APPS) + 1  # the 4 real apps + the IDENTIFY PUPPETS row
 
 VERSION_RE = re.compile(r"""VERSION\s*=\s*['"]([^'"]+)['"]""")
 
@@ -1122,7 +1111,7 @@ class HealthApp:
         canvas.blit(headline_surf, ((FRAME_W - headline_surf.get_width()) // 2, row0_y))
 
         rows_per_app = 2  # label+version row, description row
-        total_rows = rows_per_app * MENU_ITEM_COUNT
+        total_rows = rows_per_app * len(APPS)
 
         # box_row leaves one blank row between the headline and the box
         # (2026-08-15, cosmetic per user request), and box_rows is sized
@@ -1137,8 +1126,7 @@ class HealthApp:
         start_row = box_row + 1
 
         row = start_row
-        for idx in range(MENU_ITEM_COUNT):
-            is_identify_row = idx == len(APPS)
+        for idx in range(len(APPS)):
             selected = idx == self.selected
             text_color = BLACK if selected else ORANGE
             highlight_x, px_y = d.char_px(1, row)
@@ -1153,14 +1141,6 @@ class HealthApp:
                 pygame.draw.rect(canvas, ORANGE, (
                     highlight_x + HIGHLIGHT_GAP, px_y - 2,
                     highlight_w - 2 * HIGHLIGHT_GAP, d._char_h * 2 + 2))
-
-            if is_identify_row:
-                line = d._font.render(IDENTIFY_LABEL, True, text_color)
-                canvas.blit(line, (px_x, px_y))
-                desc_line = d._font.render(IDENTIFY_DESC, True, text_color)
-                canvas.blit(desc_line, (px_x + d._char_w * 2, px_y + d._char_h))
-                row += rows_per_app
-                continue
 
             _key, label, desc, cmd, script_path, _hw_check = APPS[idx]
             app_version = read_app_version(script_path)
@@ -1240,52 +1220,6 @@ class HealthApp:
             self.refresh_hardware_status()
         self.render()
 
-    def _send_identify(self, ip):
-        """Returns (ok, reason) -- reason is only meaningful when not ok.
-        Mirrors assign_to_puppet()'s HTTPError-vs-OSError split (HTTPError
-        is a subclass of OSError, so it must be caught first) -- without
-        this, a real 409 rejection from the puppet read as "UNREACHABLE"
-        even though the puppet responded just fine (caught live when a
-        strings.py bug made every identify assignment 409)."""
-        try:
-            req = urllib.request.Request(
-                f"http://{ip}:{PUPPET_PORT}/assign",
-                data=json.dumps({"app": "identify"}).encode(),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            urllib.request.urlopen(req, timeout=1.5)
-            return True, None
-        except urllib.error.HTTPError as exc:
-            return False, f"REJECTED ({exc.code})"
-        except OSError:
-            return False, "UNREACHABLE"
-
-    def identify_puppets(self):
-        """Broadcasts an assign-to-'identify' command to every puppet
-        (see STRINGS's IDLE_APP/LAUNCH_COMMANDS) -- each one switches to
-        SMPTE bars + its own hostname overlay, so physical Pi/CRT
-        pairings can be read straight off the screens after a move.
-        Blocks briefly for the confirmation, same as launch_app()'s
-        subprocess.run() already does -- this is a rare, deliberate
-        action, not something that needs main-loop-timer integration."""
-        results = [(name, *self._send_identify(ip)) for name, ip in PUPPETS]
-
-        canvas = pygame.Surface((FRAME_W, FRAME_H))
-        canvas.fill(BLACK)
-        lines = ["IDENTIFY SENT"] + [f"{name}: {'OK' if ok else reason}" for name, ok, reason in results]
-        oks = [True] + [ok for _name, ok, _reason in results]
-        y = self.display._margin_y
-        for line, ok in zip(lines, oks):
-            color = ORANGE if ok else RED
-            surf = self.display._font.render(line, True, color)
-            canvas.blit(surf, ((FRAME_W - surf.get_width()) // 2, y))
-            y += self.display._char_h
-        self.fb.write_surface(canvas)
-
-        time.sleep(2)
-        self.render()
-
     def assign_to_puppet(self, target, cmd):
         """Remote-puppet equivalent of launch_app() -- assigns `cmd` to
         `target` (a PUPPETS name) via its STRINGS /assign endpoint
@@ -1301,10 +1235,10 @@ class HealthApp:
         picking an app is what puts the remote in live control of it,
         not a separate gesture afterward (that used to be OK on a
         gauge page; removed, see _handle_gauge_page_keycode). On
-        failure, shows the same blocking confirmation screen as
-        before, same pattern as identify_puppets() -- there's nothing
-        to control if the assignment didn't take, so this is the one
-        remaining case that still needs an explicit message."""
+        failure, shows a blocking confirmation screen instead --
+        there's nothing to control if the assignment didn't take, so
+        this is the one remaining case that still needs an explicit
+        message."""
         ip = dict(PUPPETS)[target]
         ok = False
         reason = "UNREACHABLE"
@@ -1370,11 +1304,10 @@ class HealthApp:
         self.render()
 
     def _activate_menu_selection(self):
-        """Enter on the menu page -- IDENTIFY PUPPETS is always a
-        fleet-wide broadcast regardless of monitor_target, but a real
-        app row acts on whichever machine is currently selected:
-        launches locally for LOCAL, assigns remotely for a puppet.
-        Checks readiness first using the same data the row's own
+        """Enter on the menu page -- acts on whichever machine is
+        currently selected: launches locally for LOCAL, assigns
+        remotely for a puppet. Checks readiness first using the same
+        data the row's own
         HARDWARE NOT FOUND label came from -- avoids a pointless network
         round-trip for the common case (a puppet doesn't have the app
         installed) and gives instant feedback; launch_app()/
@@ -1400,9 +1333,6 @@ class HealthApp:
         if now - self._last_activation_time < MENU_ACTIVATION_DEBOUNCE_SECONDS:
             return
         self._last_activation_time = now
-        if self.selected == len(APPS):
-            self.identify_puppets()
-            return
         cmd = APPS[self.selected][3]
         hw_status = self._current_hardware_status().get(cmd, "ready")
         if hw_status != "ready":
@@ -1516,8 +1446,8 @@ class HealthApp:
         flash showing, sleeps, then clears; the caller's own subsequent
         render() (every handle_keycode call site already does one when
         a handler returns True) shows the settled, non-flashing state
-        -- same blocking-flash pattern as assign_to_puppet()/
-        identify_puppets() elsewhere in this file."""
+        -- same blocking-flash pattern as assign_to_puppet() elsewhere
+        in this file."""
         if button_id is None:
             return
         self.last_pressed_button = button_id
@@ -1712,9 +1642,9 @@ class HealthApp:
         elif code == ecodes.KEY_RIGHT:
             self.current_page = (self.current_page + 1) % PAGE_COUNT
         elif code == ecodes.KEY_UP:
-            self.selected = (self.selected - 1) % MENU_ITEM_COUNT
+            self.selected = (self.selected - 1) % len(APPS)
         elif code == ecodes.KEY_DOWN:
-            self.selected = (self.selected + 1) % MENU_ITEM_COUNT
+            self.selected = (self.selected + 1) % len(APPS)
         elif code in (ecodes.KEY_ENTER, ecodes.KEY_KPENTER, ecodes.BTN_LEFT, ecodes.BTN_MOUSE):
             self._activate_menu_selection()
             return False  # already rendered
