@@ -104,12 +104,20 @@ PUPPET_PORT = 8420
 
 # Keycodes forwarded live to a puppet's running app in control mode (see
 # assign_to_puppet()) -- must match STRINGS's RELAY_KEYS allowlist by
-# name exactly. Deliberately excludes Home/Back/Q/Esc/Power/Compose,
-# which stay local (exit control mode / open Select Target / control
-# SCRUTE itself) rather than being relayed -- those mean "exit this
-# app" in every sibling app's own handle_keycode, so relaying them
-# would kill/restart whatever's running on the puppet instead of just
-# adjusting it.
+# name exactly. Deliberately excludes Home/Back/Q/Esc/Compose, which
+# stay local (exit control mode / open Select Target / control SCRUTE
+# itself) rather than being relayed -- those mean "exit this app" in
+# every sibling app's own handle_keycode, so relaying them would
+# kill/restart whatever's running on the puppet instead of just
+# adjusting it. Power is relayed too (2026-08-17) -- see the dedicated
+# handling in handle_keycode(), which routes it here instead of opening
+# SCRUTE's own local power dialog whenever overlay_mode == "control",
+# so the *target*'s confirm dialog shows on the machine you're actually
+# controlling. This only became safe to relay once every fleet
+# machine's logind stopped independently reacting to a raw KEY_POWER
+# event (HandlePowerKey=ignore) -- otherwise the relayed keypress would
+# instantly power off the puppet before its own app dialog ever showed,
+# the same bug this whole change stemmed from on MP itself.
 CONTROL_RELAY_KEYS = {
     ecodes.KEY_UP: "KEY_UP",
     ecodes.KEY_DOWN: "KEY_DOWN",
@@ -119,6 +127,7 @@ CONTROL_RELAY_KEYS = {
     ecodes.KEY_KPENTER: "KEY_ENTER",
     ecodes.KEY_VOLUMEUP: "KEY_VOLUMEUP",
     ecodes.KEY_VOLUMEDOWN: "KEY_VOLUMEDOWN",
+    ecodes.KEY_POWER: "KEY_POWER",
 }
 
 # On-screen labels for the live-control screen's D-pad boxes (2026-08-16).
@@ -1426,7 +1435,14 @@ class HealthApp:
             return True
         if code in (ecodes.KEY_Q, ecodes.KEY_ESC):
             self._quit_requested = True
-        elif code == ecodes.KEY_POWER:
+        elif code == ecodes.KEY_POWER and self.overlay_mode != "control":
+            # Only opens SCRUTE's own local dialog outside control mode --
+            # while controlling a remote target, Power falls through to
+            # the overlay_mode == "control" branch below instead, which
+            # relays it (now in CONTROL_RELAY_KEYS) so the *target*'s own
+            # confirm dialog shows on the machine actually being
+            # controlled, not on MP. See CONTROL_RELAY_KEYS's comment
+            # for why this needed HandlePowerKey=ignore fleet-wide first.
             self.power_dialog_active = True
             self.power_dialog_selection = 0
         elif self.overlay_mode == "target_select":
@@ -1467,8 +1483,12 @@ class HealthApp:
         menu -- freed up by TARGET's move to a global hamburger binding
         (see handle_keycode), so House inherited hamburger's old
         fast-path job here. BACK exits all the way out to page 0.
-        Q/Esc/Power/TARGET are already handled globally in
-        handle_keycode before this is ever reached. Every branch flashes
+        Q/Esc/TARGET are already handled globally in handle_keycode
+        before this is ever reached. Power (2026-08-17) is deliberately
+        NOT handled globally while in control mode -- handle_keycode's
+        own KEY_POWER branch is skipped here on purpose so it falls
+        through to the CONTROL_RELAY_KEYS branch below like any other
+        relayed key. Every branch flashes
         its own button box first (see _flash_button) -- for the two
         that exit this screen, that means one frame of the live-control
         screen with the box inverted, then the transition, same as
