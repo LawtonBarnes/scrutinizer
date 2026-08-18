@@ -64,14 +64,56 @@ VERSION = "2.6"
 BASE_DIR = Path(__file__).resolve().parent
 FONT_PATH = BASE_DIR / "VCR_OSD_MONO_1.001.ttf"
 BORDER_FONT_PATH = BASE_DIR / "Px437_IBM_VGA_9x16.ttf"  # box-drawing glyphs only, VCR OSD MONO lacks them
+SETTINGS_PATH = BASE_DIR / "settings.json"  # gitignored, same pattern as STRINGS's state.json -- local preference, not source
 
 FRAME_W, FRAME_H = 720, 480
 UNDERSCAN = 0.10
 TARGET_WIDTH = 40
 
 BLACK = (0, 0, 0)
-ORANGE = (0xFF, 0xA5, 0x00)
-RED = (220, 30, 30)  # HARDWARE NOT FOUND only -- every other color is ORANGE
+
+# Three selectable color schemes (name, primary, warning) -- the Settings
+# page's COLOR: row cycles through these via apply_color_scheme(). RED
+# stays the warning color for both ORANGE and GREEN (still reads as
+# "alert" against either), but WHITE gets a GRAY warning instead since
+# red-on-white doesn't read as distinctly different from the rest of the
+# (also-bright) body text the way red-on-black/red-on-green does.
+COLOR_SCHEMES = [
+    ("ORANGE", (0xFF, 0xA5, 0x00), (220, 30, 30)),
+    ("GREEN", (0x00, 0xFF, 0x00), (220, 30, 30)),
+    ("WHITE", (0xFF, 0xFF, 0xFF), (160, 160, 160)),
+]
+DEFAULT_COLOR_SCHEME_INDEX = 0
+
+# PRIMARY_COLOR/WARNING_COLOR are the two module globals every draw
+# function in this file reads (directly, or -- for draw_text/draw_bar --
+# via a color=None default resolved inside the function body rather than
+# baked in at def time) -- see apply_color_scheme(). A scheme switch just
+# reassigns these two names; nothing else needs to know it happened.
+PRIMARY_COLOR = COLOR_SCHEMES[DEFAULT_COLOR_SCHEME_INDEX][1]
+WARNING_COLOR = COLOR_SCHEMES[DEFAULT_COLOR_SCHEME_INDEX][2]
+
+
+def apply_color_scheme(index):
+    global PRIMARY_COLOR, WARNING_COLOR
+    PRIMARY_COLOR = COLOR_SCHEMES[index][1]
+    WARNING_COLOR = COLOR_SCHEMES[index][2]
+
+
+def load_color_scheme_index():
+    try:
+        data = json.loads(SETTINGS_PATH.read_text())
+        index = int(data["color_scheme_index"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return DEFAULT_COLOR_SCHEME_INDEX
+    return index if 0 <= index < len(COLOR_SCHEMES) else DEFAULT_COLOR_SCHEME_INDEX
+
+
+def save_color_scheme_index(index):
+    try:
+        SETTINGS_PATH.write_text(json.dumps({"color_scheme_index": index}))
+    except OSError as exc:
+        print(f"Failed to save settings: {exc}", file=sys.stderr)
 
 KDSETMODE = 0x4B3A
 KD_TEXT = 0x00
@@ -166,30 +208,32 @@ CONTROL_BUTTON_IDS = {
 # etc.) -- imperceptible for a single keypress.
 BUTTON_FLASH_SECONDS = 0.15
 
-# Five pages in one Left/Right rotation, all handled by the same
-# current_page int -- gauge pages (0/1), the app menu (2), Select
-# Target (3), and Remote Control Help (4). Select Target and Remote
-# Control Help used to be separate "overlay_mode" full-screen states
-# layered on top of current_page, entered only via the TARGET/hamburger
-# button or right after a successful puppet assignment -- folded into
-# the normal page rotation 2026-08-17 so Left/Right alone can reach
-# them too; TARGET/hamburger and auto-jump-after-assign still work as
-# fast-paths into the same two page indices. Left/Right skips
+# Six pages in one Left/Right rotation, all handled by the same
+# current_page int -- gauge pages (0/1), the app menu (2), Settings (3),
+# Select Target (4), and Remote Control Help (5). Select Target and
+# Remote Control Help used to be separate "overlay_mode" full-screen
+# states layered on top of current_page, entered only via the
+# TARGET/hamburger button or right after a successful puppet assignment
+# -- folded into the normal page rotation 2026-08-17 so Left/Right alone
+# can reach them too; TARGET/hamburger and auto-jump-after-assign still
+# work as fast-paths into the same two page indices. Left/Right skips
 # CONTROL_PAGE_INDEX whenever monitor_target is LOCAL (see
 # _cycle_page) -- relaying keypresses to yourself doesn't mean
 # anything, so that page only exists in the rotation once a remote
-# target is actually selected. Up/Down means "move the menu/target
-# cursor" on pages 2/3 and does nothing on the gauge pages (removed
-# 2026-08-16 in favor of TARGET/hamburger, see
-# _handle_gauge_page_keycode). Selecting an app on the menu page acts
-# on whichever machine is currently selected (self.monitor_target):
-# launches locally for LOCAL, assigns remotely via STRINGS for a
-# puppet -- and for a puppet, that assignment is also what puts you in
-# live control of it (see assign_to_puppet).
+# target is actually selected. Settings (2026-08-18) is never skipped --
+# it's local to SCRUTE's own display regardless of monitor_target, same
+# as the app menu. Up/Down means "move the menu/target cursor" on pages
+# 2/4 and does nothing on the gauge pages (removed 2026-08-16 in favor
+# of TARGET/hamburger, see _handle_gauge_page_keycode). Selecting an app
+# on the menu page acts on whichever machine is currently selected
+# (self.monitor_target): launches locally for LOCAL, assigns remotely
+# via STRINGS for a puppet -- and for a puppet, that assignment is also
+# what puts you in live control of it (see assign_to_puppet).
 MENU_PAGE_INDEX = 2
-TARGET_SELECT_PAGE_INDEX = 3
-CONTROL_PAGE_INDEX = 4
-PAGE_COUNT = 5
+SETTINGS_PAGE_INDEX = 3
+TARGET_SELECT_PAGE_INDEX = 4
+CONTROL_PAGE_INDEX = 5
+PAGE_COUNT = 6
 PUPPET_POLL_TIMEOUT_SECONDS = 2
 PUPPET_POLL_INTERVAL_SECONDS = 3
 
@@ -644,7 +688,16 @@ class HealthDisplay:
     def char_px(self, col, row):
         return (self._margin_x + col * self._char_w, self._margin_y + row * self._char_h)
 
-    def draw_text(self, canvas, col, row, text, color=ORANGE, bold=False, font=None):
+    def draw_text(self, canvas, col, row, text, color=None, bold=False, font=None):
+        # color=None resolved here, not defaulted to PRIMARY_COLOR up in
+        # the signature -- a default *argument value* is evaluated once,
+        # at def time, so it would freeze in whatever scheme was active
+        # when the class body first ran and never track a later
+        # apply_color_scheme() call (confirmed the hard way: panel
+        # borders/titles, which never pass color explicitly, stayed
+        # ORANGE forever until this was fixed).
+        if color is None:
+            color = PRIMARY_COLOR
         font = font or self._font
         font.set_bold(bold)
         surf = font.render(text, True, color)
@@ -725,7 +778,7 @@ class HealthDisplay:
         content_h = (panel.h_chars - 2) * self._char_h
         return pygame.Rect(content_x, content_y, content_w, content_h)
 
-    def draw_bar(self, canvas, rect, fraction, label=None, color=ORANGE):
+    def draw_bar(self, canvas, rect, fraction, label=None, color=None):
         """`rect` is the *full* available width for bar + label combined --
         the label's actual rendered width is measured first and the bar
         gets whatever's left, rather than assuming a fixed label width
@@ -737,11 +790,13 @@ class HealthDisplay:
         top edge moved down to absorb it (bottom edge unchanged) -- a
         small gap between the bar and the line of text above it, and
         closer to the text glyph height next to it (2026-08-14)."""
+        if color is None:  # see draw_text's color=None comment -- same reason
+            color = PRIMARY_COLOR
         fraction = max(0.0, min(1.0, fraction))
         bar_rect = pygame.Rect(rect.x + self._char_w, rect.y + 2, rect.width - self._char_w, rect.height - 2)
         label_surf = None
         if label:
-            label_surf = self._label_font.render(label, True, ORANGE)
+            label_surf = self._label_font.render(label, True, PRIMARY_COLOR)
             bar_rect.width -= label_surf.get_width() + 12
         # Border is 2px, not 1px -- a single-scanline-thin horizontal edge
         # only lands on one of the two interlaced fields each frame, which
@@ -750,7 +805,7 @@ class HealthDisplay:
         # output). 2px puts the top/bottom edges on both fields every
         # frame. The fill inset grows to match so it still sits cleanly
         # inside the thicker border rather than overlapping it.
-        pygame.draw.rect(canvas, ORANGE, bar_rect, 2)
+        pygame.draw.rect(canvas, PRIMARY_COLOR, bar_rect, 2)
         fill_w = int((bar_rect.width - 4) * fraction)
         if fill_w > 0:
             pygame.draw.rect(canvas, color, (bar_rect.x + 2, bar_rect.y + 2, fill_w, bar_rect.height - 4))
@@ -778,7 +833,7 @@ def draw_cpu_panel(display, canvas, rect, stats):
     # a 4-digit one (1400) -- keeps CLOCK/MHZ from jittering left-right as
     # the value crosses that digit-count boundary.
     clock_text = f"{clock:4.0f} MHZ" if clock is not None else "N/A"
-    surf = display._font.render(f" TEMP: {temp_text}   CLOCK: {clock_text}", True, ORANGE)
+    surf = display._font.render(f" TEMP: {temp_text}   CLOCK: {clock_text}", True, PRIMARY_COLOR)
     canvas.blit(surf, (rect.x, y))
     y += display._char_h
 
@@ -792,12 +847,12 @@ def draw_cpu_panel(display, canvas, rect, stats):
     # -- anchoring it independently of how much space the bars above
     # actually used is what caused it to overlap the last core's bar.
     load1, load5, load15 = stats.get("loadavg", (0, 0, 0))
-    surf = display._font.render(f" LOAD: {load1:.2f} {load5:.2f} {load15:.2f}", True, ORANGE)
+    surf = display._font.render(f" LOAD: {load1:.2f} {load5:.2f} {load15:.2f}", True, PRIMARY_COLOR)
     canvas.blit(surf, (rect.x, y))
     y += display._char_h
 
     status = stats.get("throttled", "UNKNOWN")
-    surf = display._font.render(f" STATUS: {status}", True, ORANGE)
+    surf = display._font.render(f" STATUS: {status}", True, PRIMARY_COLOR)
     canvas.blit(surf, (rect.x, y))
 
 
@@ -812,10 +867,10 @@ def draw_memory_panel(display, canvas, rect, stats):
 
     used_mb = mem.used / (1024 * 1024)
     total_mb = mem.total / (1024 * 1024)
-    surf = display._font.render(f" USED:  {used_mb:.0f} MB", True, ORANGE)
+    surf = display._font.render(f" USED:  {used_mb:.0f} MB", True, PRIMARY_COLOR)
     canvas.blit(surf, (rect.x, y))
     y += display._char_h
-    surf = display._font.render(f" TOTAL: {total_mb:.0f} MB", True, ORANGE)
+    surf = display._font.render(f" TOTAL: {total_mb:.0f} MB", True, PRIMARY_COLOR)
     canvas.blit(surf, (rect.x, y))
 
 
@@ -830,19 +885,19 @@ def draw_storage_panel(display, canvas, rect, stats):
 
     used_gb = disk.used / (1024 ** 3)
     free_gb = disk.free / (1024 ** 3)
-    surf = display._font.render(f" {used_gb:.0f} GB USED   {free_gb:.0f} GB FREE", True, ORANGE)
+    surf = display._font.render(f" {used_gb:.0f} GB USED   {free_gb:.0f} GB FREE", True, PRIMARY_COLOR)
     canvas.blit(surf, (rect.x, y))
 
 
 def draw_wifi_panel(display, canvas, rect, stats):
     y = rect.y
     ssid = stats.get("wifi_ssid") or "NOT CONNECTED"
-    surf = display._font.render(f" SSID: {ssid}", True, ORANGE)
+    surf = display._font.render(f" SSID: {ssid}", True, PRIMARY_COLOR)
     canvas.blit(surf, (rect.x, y))
     y += display._char_h
 
     ip = stats.get("ip", "N/A")
-    surf = display._font.render(f" IP: {ip}", True, ORANGE)
+    surf = display._font.render(f" IP: {ip}", True, PRIMARY_COLOR)
     canvas.blit(surf, (rect.x, y))
     y += display._char_h
 
@@ -852,10 +907,10 @@ def draw_wifi_panel(display, canvas, rect, stats):
         bar_rect = pygame.Rect(rect.x, y, rect.width, display._char_h - 4)
         display.draw_bar(canvas, bar_rect, quality / 70.0, label=f" {quality:.0f}/70 ")
         y += display._char_h
-        surf = display._font.render(f" SIGNAL: {level:.0f} DBM", True, ORANGE)
+        surf = display._font.render(f" SIGNAL: {level:.0f} DBM", True, PRIMARY_COLOR)
         canvas.blit(surf, (rect.x, y))
     else:
-        surf = display._font.render(" NO WIRELESS LINK", True, ORANGE)
+        surf = display._font.render(" NO WIRELESS LINK", True, PRIMARY_COLOR)
         canvas.blit(surf, (rect.x, y))
 
 
@@ -865,10 +920,10 @@ def draw_network_panel(display, canvas, rect, stats):
     down = stats.get("net_down_kbs")
     up_text = f"{up:6.1f} KB/S" if up is not None else "  --.- KB/S"
     down_text = f"{down:6.1f} KB/S" if down is not None else "  --.- KB/S"
-    surf = display._font.render(f" UP:   {up_text}", True, ORANGE)
+    surf = display._font.render(f" UP:   {up_text}", True, PRIMARY_COLOR)
     canvas.blit(surf, (rect.x, y))
     y += display._char_h
-    surf = display._font.render(f" DOWN: {down_text}", True, ORANGE)
+    surf = display._font.render(f" DOWN: {down_text}", True, PRIMARY_COLOR)
     canvas.blit(surf, (rect.x, y))
 
 
@@ -944,6 +999,12 @@ class HealthApp:
         self.remote_poller = RemotePoller()
         self.monitor_target = "LOCAL"  # set via the Select Target overlay -- "LOCAL" or a PUPPETS name
 
+        # Settings-page state (2026-08-18). Persisted color choice loads
+        # before anything renders, so the very first frame already shows
+        # the user's chosen scheme instead of flashing ORANGE first.
+        self.color_scheme_index = load_color_scheme_index()
+        apply_color_scheme(self.color_scheme_index)
+
         # App-menu screen state.
         self.selected = 0
         self._last_activation_time = 0.0  # debounces _activate_menu_selection -- see MENU_ACTIVATION_DEBOUNCE_SECONDS
@@ -955,7 +1016,7 @@ class HealthApp:
         self.pending_power_action = None
         self._rel_accum = {"x": 0, "y": 0}
 
-        # Select Target and Remote Control Help are just pages 3/4 of
+        # Select Target and Remote Control Help are just pages 4/5 of
         # current_page now (2026-08-17, see the comment above
         # TARGET_SELECT_PAGE_INDEX/CONTROL_PAGE_INDEX) -- no separate
         # overlay_mode/control_mode_target state needed anymore.
@@ -1044,6 +1105,8 @@ class HealthApp:
             self._build_control_mode_screen(canvas)
         elif self.current_page == TARGET_SELECT_PAGE_INDEX:
             self._build_target_select_screen(canvas)
+        elif self.current_page == SETTINGS_PAGE_INDEX:
+            self._build_settings_page(canvas)
         else:
             self.build_health_canvas(canvas)  # dispatches to the menu page internally for MENU_PAGE_INDEX
         if self.power_dialog_active:
@@ -1081,13 +1144,13 @@ class HealthApp:
         if offline:
             canvas.fill(BLACK)
             msg = f"{target_label} OFFLINE / UNREACHABLE"
-            msg_surf = self.display._font.render(msg, True, RED)
+            msg_surf = self.display._font.render(msg, True, WARNING_COLOR)
             canvas.blit(msg_surf, ((FRAME_W - msg_surf.get_width()) // 2, (FRAME_H - msg_surf.get_height()) // 2))
         else:
             self.display.render_page(canvas, panels, stats)
 
         headline = self._page_headline(target_label)
-        headline_surf = self.display._label_font.render(headline, True, ORANGE)
+        headline_surf = self.display._label_font.render(headline, True, PRIMARY_COLOR)
         row0_y = self.display.char_px(0, 0)[1]
         canvas.blit(headline_surf, ((FRAME_W - headline_surf.get_width()) // 2, row0_y))
 
@@ -1120,7 +1183,7 @@ class HealthApp:
         # position consistent across all 3 pages instead of nesting it
         # inside the box like before.
         headline = self._page_headline(target_label)
-        headline_surf = d._label_font.render(headline, True, ORANGE)
+        headline_surf = d._label_font.render(headline, True, PRIMARY_COLOR)
         row0_y = d.char_px(0, 0)[1]
         canvas.blit(headline_surf, ((FRAME_W - headline_surf.get_width()) // 2, row0_y))
 
@@ -1145,7 +1208,7 @@ class HealthApp:
         row = start_row
         for idx in range(len(APPS)):
             selected = idx == self.selected
-            text_color = BLACK if selected else ORANGE
+            text_color = BLACK if selected else PRIMARY_COLOR
             highlight_x, px_y = d.char_px(1, row)
             px_x = highlight_x + d._char_w  # one extra space between the border/highlight and the text
             if selected:
@@ -1155,7 +1218,7 @@ class HealthApp:
                 # the exact content width instead, which put the
                 # highlight right up against/into the border.
                 HIGHLIGHT_GAP = 4
-                pygame.draw.rect(canvas, ORANGE, (
+                pygame.draw.rect(canvas, PRIMARY_COLOR, (
                     highlight_x + HIGHLIGHT_GAP, px_y - 2,
                     highlight_w - 2 * HIGHLIGHT_GAP, d._char_h * 2 + 2))
 
@@ -1166,20 +1229,21 @@ class HealthApp:
             hw_status = hardware_status.get(cmd, "ready")
             hw_ok = hw_status == "ready"
             desc_text = desc.upper() if hw_ok else HW_STATUS_LABELS.get(hw_status, "HARDWARE NOT FOUND")
-            # RED on the normal black background makes the warning stand
-            # out; on the selected row's orange highlight it stays BLACK
-            # like the rest of that row's text -- red-on-orange is low
-            # contrast, and the text itself already reads as a warning.
-            desc_color = text_color if (hw_ok or selected) else RED
+            # The warning color reads clearly against the black page
+            # background; on the selected row's highlight it stays BLACK
+            # like the rest of that row's text instead -- warning-on-fill
+            # is low contrast for every scheme, and the text itself
+            # already reads as a warning.
+            desc_color = text_color if (hw_ok or selected) else WARNING_COLOR
             desc_line = d._font.render(desc_text, True, desc_color)
             canvas.blit(desc_line, (px_x + d._char_w * 2, px_y + d._char_h))
             row += rows_per_app
 
     def draw_power_dialog(self, canvas):
         lines = ["ARE YOU SURE YOU WANT", "TO SHUT DOWN?"]
-        line_surfs = [self.osd_font.render(line, True, ORANGE) for line in lines]
+        line_surfs = [self.osd_font.render(line, True, PRIMARY_COLOR) for line in lines]
         option_surfs = [
-            self.option_font.render(opt, True, BLACK if i == self.power_dialog_selection else ORANGE)
+            self.option_font.render(opt, True, BLACK if i == self.power_dialog_selection else PRIMARY_COLOR)
             for i, opt in enumerate(POWER_OPTIONS)
         ]
 
@@ -1191,7 +1255,7 @@ class HealthApp:
 
         box = pygame.Surface((content_w + pad_x * 2, content_h + pad_y * 2))
         box.fill(BLACK)
-        pygame.draw.rect(box, ORANGE, box.get_rect(), 3)
+        pygame.draw.rect(box, PRIMARY_COLOR, box.get_rect(), 3)
 
         y = pad_y
         for surf in line_surfs:
@@ -1203,7 +1267,7 @@ class HealthApp:
         for i, surf in enumerate(option_surfs):
             if i == self.power_dialog_selection:
                 highlight = pygame.Rect(x - 10, y - 6, surf.get_width() + 20, surf.get_height() + 12)
-                pygame.draw.rect(box, ORANGE, highlight)
+                pygame.draw.rect(box, PRIMARY_COLOR, highlight)
             box.blit(surf, (x, y))
             x += surf.get_width() + gap
 
@@ -1283,7 +1347,7 @@ class HealthApp:
         canvas = pygame.Surface((FRAME_W, FRAME_H))
         canvas.fill(BLACK)
         lines = [f"{target}: ASSIGN {cmd.upper()}", f"FAILED -- {reason}"]
-        colors = [ORANGE, RED]
+        colors = [PRIMARY_COLOR, WARNING_COLOR]
         y = self.display._margin_y
         for line, color in zip(lines, colors):
             surf = self.display._font.render(line, True, color)
@@ -1313,7 +1377,7 @@ class HealthApp:
         lines = [f"{cmd.upper()} {reason}", where]
         y = self.display._margin_y
         for line in lines:
-            surf = self.display._font.render(line, True, RED)
+            surf = self.display._font.render(line, True, WARNING_COLOR)
             canvas.blit(surf, ((FRAME_W - surf.get_width()) // 2, y))
             y += self.display._char_h
         self.fb.write_surface(canvas)
@@ -1404,12 +1468,15 @@ class HealthApp:
             return self._handle_control_mode_keycode(code)
         elif self.current_page == MENU_PAGE_INDEX:
             return self._handle_menu_page_keycode(code)
+        elif self.current_page == SETTINGS_PAGE_INDEX:
+            return self._handle_settings_page_keycode(code)
         else:
             return self._handle_gauge_page_keycode(code)
         return True
 
     def _cycle_page(self, direction):
-        """Left/Right, handled globally for pages 0-3 (2026-08-17 --
+        """Left/Right, handled globally for every page except
+        CONTROL_PAGE_INDEX (2026-08-17 --
         previously each per-page handler had its own identical copy of
         this, before Select Target/Remote Control Help joined the
         normal rotation). NOT called at all while on CONTROL_PAGE_INDEX
@@ -1580,7 +1647,7 @@ class HealthApp:
         target_label = (stats or {}).get("hostname", self.monitor_target).upper()
 
         headline = f"CONTROLLING: {target_label}"
-        headline_surf = d._label_font.render(headline, True, ORANGE)
+        headline_surf = d._label_font.render(headline, True, PRIMARY_COLOR)
         row0_y = d.char_px(0, 0)[1]
         canvas.blit(headline_surf, ((FRAME_W - headline_surf.get_width()) // 2, row0_y))
 
@@ -1617,11 +1684,11 @@ class HealthApp:
                 fill_y = y + d._char_h + BOX_FLASH_GAP
                 fill_w = (w - 2) * d._char_w - 2 * BOX_FLASH_GAP
                 fill_h = (h - 2) * d._char_h - 2 * BOX_FLASH_GAP
-                pygame.draw.rect(canvas, ORANGE, (fill_x, fill_y, fill_w, fill_h))
+                pygame.draw.rect(canvas, PRIMARY_COLOR, (fill_x, fill_y, fill_w, fill_h))
             d.draw_panel_frame(canvas, Panel(col, row, w, h, title=None))
             content_row = row + (h - 1) // 2
             d.draw_text(canvas, col + 1, content_row, centered(label, w - 2),
-                         color=BLACK if pressed else ORANGE)
+                         color=BLACK if pressed else PRIMARY_COLOR)
 
         draw_box(0, 1, 10, 3, "APPS", "apps")
         draw_box(30, 1, 10, 3, "NOFX")  # no keycode identified yet -- never flashes, see CONTROL_BUTTON_IDS
@@ -1632,9 +1699,9 @@ class HealthApp:
         ok_pressed = self.last_pressed_button == "ok"
         if ok_pressed:  # deliberately unboxed (user's design choice) -- inset fill matches the boxed buttons'
             x, y = d.char_px(14, 6)
-            pygame.draw.rect(canvas, ORANGE, (
+            pygame.draw.rect(canvas, PRIMARY_COLOR, (
                 x + OK_FLASH_GAP, y, 10 * d._char_w - 2 * OK_FLASH_GAP, d._char_h))
-        d.draw_text(canvas, 14 + 1, 6, centered("OK", 10), color=BLACK if ok_pressed else ORANGE)
+        d.draw_text(canvas, 14 + 1, 6, centered("OK", 10), color=BLACK if ok_pressed else PRIMARY_COLOR)
         draw_box(27, 5, 12, 3, CONTROL_DPAD_LABELS["right"], "right")
 
         draw_box(14, 7, 12, 3, CONTROL_DPAD_LABELS["down"], "down")
@@ -1650,9 +1717,9 @@ class HealthApp:
         # 40x16 grid this screen is built against has no spare row below
         # the MUTE/VOL+ boxes.
         if not fresh:
-            footer, footer_color = f"{target_label} NOT RESPONDING", RED
+            footer, footer_color = f"{target_label} NOT RESPONDING", WARNING_COLOR
         elif self.control_mode_last_result == "UNREACHABLE":
-            footer, footer_color = "LAST SEND FAILED -- UNREACHABLE", RED
+            footer, footer_color = "LAST SEND FAILED -- UNREACHABLE", WARNING_COLOR
         else:
             app_cmd = (stats or {}).get("app")
             if app_cmd:
@@ -1662,7 +1729,7 @@ class HealthApp:
                 )
             else:
                 app_label = "NONE"
-            footer, footer_color = f"RUNNING: {app_label}", ORANGE
+            footer, footer_color = f"RUNNING: {app_label}", PRIMARY_COLOR
         footer_surf = d._font.render(footer, True, footer_color)
         row15_y = d.char_px(0, 15)[1]
         canvas.blit(footer_surf, ((FRAME_W - footer_surf.get_width()) // 2, row15_y))
@@ -1676,7 +1743,7 @@ class HealthApp:
         canvas.fill(BLACK)
         d = self.display
 
-        headline_surf = d._label_font.render("SELECT TARGET", True, ORANGE)
+        headline_surf = d._label_font.render("SELECT TARGET", True, PRIMARY_COLOR)
         row0_y = d.char_px(0, 0)[1]
         canvas.blit(headline_surf, ((FRAME_W - headline_surf.get_width()) // 2, row0_y))
 
@@ -1693,13 +1760,13 @@ class HealthApp:
         row = box_row + 2
         for idx, name in enumerate(MONITOR_TARGETS):
             selected = idx == self.target_selected
-            text_color = BLACK if selected else ORANGE
+            text_color = BLACK if selected else PRIMARY_COLOR
             highlight_x, px_y = d.char_px(1, row)
             px_x = highlight_x + d._char_w
             if selected:
                 highlight_w = (d._width - 2) * d._char_w
                 HIGHLIGHT_GAP = 4
-                pygame.draw.rect(canvas, ORANGE, (
+                pygame.draw.rect(canvas, PRIMARY_COLOR, (
                     highlight_x + HIGHLIGHT_GAP, px_y - 2,
                     highlight_w - 2 * HIGHLIGHT_GAP, d._char_h + 2))
 
@@ -1711,6 +1778,49 @@ class HealthApp:
             line = d._font.render(label, True, text_color)
             canvas.blit(line, (px_x, px_y))
             row += 1
+
+    def _build_settings_page(self, canvas):
+        """Page SETTINGS_PAGE_INDEX (2026-08-18) -- currently just the one
+        COLOR: row. Deliberately NOT run through _page_headline like the
+        gauge/menu pages -- "CONTROLLING: <target>" doesn't make sense
+        here, since a color scheme is SCRUTE's own display preference,
+        not something tied to whichever puppet monitor_target happens to
+        point at. Mirrors _build_target_select_screen's fixed-headline/
+        box-list structure instead."""
+        canvas.fill(BLACK)
+        d = self.display
+
+        headline_surf = d._label_font.render("SETTINGS", True, PRIMARY_COLOR)
+        row0_y = d.char_px(0, 0)[1]
+        canvas.blit(headline_surf, ((FRAME_W - headline_surf.get_width()) // 2, row0_y))
+
+        title = f"CENTRAL SCRUTINIZER {VERSION}".upper()
+        box_row = 2
+        box_rows = d._height - box_row
+        self.display.draw_panel_frame(canvas, Panel(
+            0, box_row, d._width, box_rows, title, subtitle="BY METAL SHOP"))
+
+        row = box_row + 2
+        label_x, px_y = d.char_px(1, row)
+        label_surf = d._font.render("COLOR:", True, PRIMARY_COLOR)
+        canvas.blit(label_surf, (label_x, px_y))
+
+        # Each scheme name gets its own filled box when active (same
+        # inverted-fill treatment as a selected app-menu row/POWER_OPTIONS
+        # dialog choice) rather than a highlight bar under the whole row --
+        # there's no natural "row width" here the way there is for a
+        # full-width app-menu entry, just three short labels in a line.
+        OPTION_GAP = 2  # chars between one option box and the next
+        option_x = label_x + label_surf.get_width() + d._char_w * 2
+        for idx, (name, _primary, _warn) in enumerate(COLOR_SCHEMES):
+            selected = idx == self.color_scheme_index
+            opt_surf = d._font.render(name, True, BLACK if selected else PRIMARY_COLOR)
+            pad = d._char_w // 2
+            opt_rect = pygame.Rect(option_x - pad, px_y - 2, opt_surf.get_width() + 2 * pad, d._char_h)
+            if selected:
+                pygame.draw.rect(canvas, PRIMARY_COLOR, opt_rect)
+            canvas.blit(opt_surf, (option_x, px_y))
+            option_x = opt_rect.right + OPTION_GAP * d._char_w
 
     def _handle_menu_page_keycode(self, code):
         """Page MENU_PAGE_INDEX -- Left/Right is handled globally now
@@ -1729,6 +1839,25 @@ class HealthApp:
         elif code in (ecodes.KEY_ENTER, ecodes.KEY_KPENTER, ecodes.BTN_LEFT, ecodes.BTN_MOUSE):
             self._activate_menu_selection()
             return False  # already rendered
+        else:
+            return False
+        return True
+
+    def _handle_settings_page_keycode(self, code):
+        """Page SETTINGS_PAGE_INDEX -- Left/Right is handled globally
+        (see _cycle_page) for page navigation, same as every other
+        non-control page, so OK/Enter is what cycles the COLOR: value
+        here instead (matches the app menu's Enter="act on the
+        highlighted thing" convention) rather than reusing Left/Right,
+        which would conflict with paging away from this screen
+        entirely. Only one setting exists yet, so there's no cursor to
+        move with Up/Down -- revisit if a second setting is ever added."""
+        if code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME, ecodes.KEY_BACK):
+            self.current_page = 0
+        elif code in (ecodes.KEY_ENTER, ecodes.KEY_KPENTER, ecodes.BTN_LEFT, ecodes.BTN_MOUSE):
+            self.color_scheme_index = (self.color_scheme_index + 1) % len(COLOR_SCHEMES)
+            apply_color_scheme(self.color_scheme_index)
+            save_color_scheme_index(self.color_scheme_index)
         else:
             return False
         return True
