@@ -66,7 +66,7 @@ FONT_PATH = BASE_DIR / "VCR_OSD_MONO_1.001.ttf"
 BORDER_FONT_PATH = BASE_DIR / "Px437_IBM_VGA_9x16.ttf"  # box-drawing glyphs only, VCR OSD MONO lacks them
 SETTINGS_PATH = BASE_DIR / "settings.json"  # gitignored, same pattern as STRINGS's state.json -- local preference, not source
 SPLASH_PATH = BASE_DIR / "splash.png"  # optional -- see show_splash()
-SPLASH_SECONDS = 3.0
+SPLASH_SECONDS = 5.0
 
 FRAME_W, FRAME_H = 720, 480
 UNDERSCAN = 0.10
