@@ -65,6 +65,8 @@ BASE_DIR = Path(__file__).resolve().parent
 FONT_PATH = BASE_DIR / "VCR_OSD_MONO_1.001.ttf"
 BORDER_FONT_PATH = BASE_DIR / "Px437_IBM_VGA_9x16.ttf"  # box-drawing glyphs only, VCR OSD MONO lacks them
 SETTINGS_PATH = BASE_DIR / "settings.json"  # gitignored, same pattern as STRINGS's state.json -- local preference, not source
+SPLASH_PATH = BASE_DIR / "splash.png"  # optional -- see show_splash()
+SPLASH_SECONDS = 3.0
 
 FRAME_W, FRAME_H = 720, 480
 UNDERSCAN = 0.10
@@ -331,6 +333,34 @@ class FrameBuffer:
     def close(self):
         self.mm.close()
         os.close(self.fd)
+
+
+def show_splash(fb):
+    """Blocking splash shown once at SCRUTE's own launch (its process
+    startup, not the machine's Plymouth boot splash -- see
+    project_bars/the McBrain devil-logo work for that separate, OS-level
+    splash) -- same technique/rationale as bars.py's version of this
+    function, duplicated per this codebase's no-shared-library
+    convention. Called once from HealthApp.__init__, NOT from
+    acquire_console() -- that method is also re-run every time control
+    returns from a launched app, and the splash should only ever play on
+    SCRUTE's own initial startup, not on every trip back from BARS/
+    LOUDNESS/etc."""
+    if not SPLASH_PATH.exists():
+        return
+    try:
+        img = pygame.image.load(str(SPLASH_PATH)).convert()
+    except (pygame.error, OSError) as exc:
+        print(f"Splash load failed: {exc}", file=sys.stderr)
+        return
+    canvas = pygame.Surface((FRAME_W, FRAME_H))
+    canvas.fill(BLACK)
+    img_w, img_h = img.get_size()
+    scale = min(FRAME_W / img_w, FRAME_H / img_h)
+    scaled = pygame.transform.smoothscale(img, (int(img_w * scale), int(img_h * scale)))
+    canvas.blit(scaled, ((FRAME_W - scaled.get_width()) // 2, (FRAME_H - scaled.get_height()) // 2))
+    fb.write_surface(canvas)
+    time.sleep(SPLASH_SECONDS)
 
 
 ########  Stat-gathering  ######################################################
@@ -1035,6 +1065,7 @@ class HealthApp:
         self.tty_fd = None
         self.console_graphics_mode = False
         self.acquire_console()
+        show_splash(self.fb)
 
     def _handle_signal(self, signum, frame):
         self._quit_requested = True
