@@ -1004,6 +1004,7 @@ class HealthApp:
         # the user's chosen scheme instead of flashing ORANGE first.
         self.color_scheme_index = load_color_scheme_index()
         apply_color_scheme(self.color_scheme_index)
+        self.settings_selected = self.color_scheme_index  # cursor on the Settings page -- see _cycle_page's reset-on-landing
 
         # App-menu screen state.
         self.selected = 0
@@ -1507,6 +1508,13 @@ class HealthApp:
             self.control_mode_last_result = None
         elif page == TARGET_SELECT_PAGE_INDEX and self.current_page != TARGET_SELECT_PAGE_INDEX:
             self.target_selected = MONITOR_TARGETS.index(self.monitor_target)
+        elif page == SETTINGS_PAGE_INDEX and self.current_page != SETTINGS_PAGE_INDEX:
+            # Re-sync the cursor to whatever's actually active on a fresh
+            # landing, same reasoning as target_selected above -- without
+            # this, leaving mid-browse (before pressing OK) and coming
+            # back later would show the cursor on the stale spot instead
+            # of the real current scheme.
+            self.settings_selected = self.color_scheme_index
         self.current_page = page
 
     def _handle_gauge_page_keycode(self, code):
@@ -1781,12 +1789,18 @@ class HealthApp:
 
     def _build_settings_page(self, canvas):
         """Page SETTINGS_PAGE_INDEX (2026-08-18) -- currently just the one
-        COLOR: row. Deliberately NOT run through _page_headline like the
-        gauge/menu pages -- "CONTROLLING: <target>" doesn't make sense
-        here, since a color scheme is SCRUTE's own display preference,
-        not something tied to whichever puppet monitor_target happens to
-        point at. Mirrors _build_target_select_screen's fixed-headline/
-        box-list structure instead."""
+        COLOR: setting, stacked vertically (2026-08-18 revision -- the
+        original horizontal ORANGE/GREEN/WHITE row on one line conflicted
+        with Left/Right's global page-navigation meaning, so there was no
+        way to move between the three options at all). Deliberately NOT
+        run through _page_headline like the gauge/menu pages --
+        "CONTROLLING: <target>" doesn't make sense here, since a color
+        scheme is SCRUTE's own display preference, not something tied to
+        whichever puppet monitor_target happens to point at. Mirrors
+        _build_target_select_screen's fixed-headline/box-list structure,
+        including its exact highlight-bar row style, since this is now
+        the same shape of UI: a vertical list, Up/Down moves the cursor,
+        OK commits (see _handle_settings_page_keycode)."""
         canvas.fill(BLACK)
         d = self.display
 
@@ -1802,25 +1816,24 @@ class HealthApp:
 
         row = box_row + 2
         label_x, px_y = d.char_px(1, row)
-        label_surf = d._font.render("COLOR:", True, PRIMARY_COLOR)
+        label_surf = d._font.render(" COLOR:", True, PRIMARY_COLOR)
         canvas.blit(label_surf, (label_x, px_y))
+        row += 1
 
-        # Each scheme name gets its own filled box when active (same
-        # inverted-fill treatment as a selected app-menu row/POWER_OPTIONS
-        # dialog choice) rather than a highlight bar under the whole row --
-        # there's no natural "row width" here the way there is for a
-        # full-width app-menu entry, just three short labels in a line.
-        OPTION_GAP = 2  # chars between one option box and the next
-        option_x = label_x + label_surf.get_width() + d._char_w * 2
         for idx, (name, _primary, _warn) in enumerate(COLOR_SCHEMES):
-            selected = idx == self.color_scheme_index
-            opt_surf = d._font.render(name, True, BLACK if selected else PRIMARY_COLOR)
-            pad = d._char_w // 2
-            opt_rect = pygame.Rect(option_x - pad, px_y - 2, opt_surf.get_width() + 2 * pad, d._char_h)
+            selected = idx == self.settings_selected
+            text_color = BLACK if selected else PRIMARY_COLOR
+            highlight_x, opt_y = d.char_px(1, row)
+            opt_x = highlight_x + d._char_w
             if selected:
-                pygame.draw.rect(canvas, PRIMARY_COLOR, opt_rect)
-            canvas.blit(opt_surf, (option_x, px_y))
-            option_x = opt_rect.right + OPTION_GAP * d._char_w
+                highlight_w = (d._width - 2) * d._char_w
+                HIGHLIGHT_GAP = 4
+                pygame.draw.rect(canvas, PRIMARY_COLOR, (
+                    highlight_x + HIGHLIGHT_GAP, opt_y - 2,
+                    highlight_w - 2 * HIGHLIGHT_GAP, d._char_h + 2))
+            line = d._font.render(name, True, text_color)
+            canvas.blit(line, (opt_x, opt_y))
+            row += 1
 
     def _handle_menu_page_keycode(self, code):
         """Page MENU_PAGE_INDEX -- Left/Right is handled globally now
@@ -1845,17 +1858,23 @@ class HealthApp:
 
     def _handle_settings_page_keycode(self, code):
         """Page SETTINGS_PAGE_INDEX -- Left/Right is handled globally
-        (see _cycle_page) for page navigation, same as every other
-        non-control page, so OK/Enter is what cycles the COLOR: value
-        here instead (matches the app menu's Enter="act on the
-        highlighted thing" convention) rather than reusing Left/Right,
-        which would conflict with paging away from this screen
-        entirely. Only one setting exists yet, so there's no cursor to
-        move with Up/Down -- revisit if a second setting is ever added."""
+        (see _cycle_page) for page navigation, so it can't also mean
+        "change the COLOR option" here (that was the original
+        2026-08-18 design's bug -- Left/Right just paged away instead).
+        Up/Down moves self.settings_selected over the three stacked
+        COLOR_SCHEMES rows instead, mirroring the app menu/Select
+        Target's own Up/Down-then-OK convention exactly. OK commits the
+        highlighted row -- applies it live and persists it -- moving the
+        cursor alone does NOT change the active scheme, same as
+        highlighting an app on the menu page doesn't launch it."""
         if code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME, ecodes.KEY_BACK):
             self.current_page = 0
+        elif code == ecodes.KEY_UP:
+            self.settings_selected = (self.settings_selected - 1) % len(COLOR_SCHEMES)
+        elif code == ecodes.KEY_DOWN:
+            self.settings_selected = (self.settings_selected + 1) % len(COLOR_SCHEMES)
         elif code in (ecodes.KEY_ENTER, ecodes.KEY_KPENTER, ecodes.BTN_LEFT, ecodes.BTN_MOUSE):
-            self.color_scheme_index = (self.color_scheme_index + 1) % len(COLOR_SCHEMES)
+            self.color_scheme_index = self.settings_selected
             apply_color_scheme(self.color_scheme_index)
             save_color_scheme_index(self.color_scheme_index)
         else:
