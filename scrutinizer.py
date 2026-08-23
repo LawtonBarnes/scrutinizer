@@ -215,32 +215,37 @@ CONTROL_BUTTON_IDS = {
 # etc.) -- imperceptible for a single keypress.
 BUTTON_FLASH_SECONDS = 0.15
 
-# Six pages in one Left/Right rotation, all handled by the same
-# current_page int -- gauge pages (0/1), the app menu (2), Settings (3),
-# Select Target (4), and Remote Control Help (5). Select Target and
-# Remote Control Help used to be separate "overlay_mode" full-screen
-# states layered on top of current_page, entered only via the
-# TARGET/hamburger button or right after a successful puppet assignment
-# -- folded into the normal page rotation 2026-08-17 so Left/Right alone
-# can reach them too; TARGET/hamburger and auto-jump-after-assign still
-# work as fast-paths into the same two page indices. Left/Right skips
-# CONTROL_PAGE_INDEX whenever monitor_target is LOCAL (see
-# _cycle_page) -- relaying keypresses to yourself doesn't mean
-# anything, so that page only exists in the rotation once a remote
-# target is actually selected. Settings (2026-08-18) is never skipped --
-# it's local to SCRUTE's own display regardless of monitor_target, same
-# as the app menu. Up/Down means "move the menu/target cursor" on pages
-# 2/4 and does nothing on the gauge pages (removed 2026-08-16 in favor
-# of TARGET/hamburger, see _handle_gauge_page_keycode). Selecting an app
-# on the menu page acts on whichever machine is currently selected
-# (self.monitor_target): launches locally for LOCAL, assigns remotely
-# via STRINGS for a puppet -- and for a puppet, that assignment is also
-# what puts you in live control of it (see assign_to_puppet).
-MENU_PAGE_INDEX = 2
-SETTINGS_PAGE_INDEX = 3
-TARGET_SELECT_PAGE_INDEX = 4
-CONTROL_PAGE_INDEX = 5
-PAGE_COUNT = 6
+# Seven pages in one Left/Right rotation, all handled by the same
+# current_page int -- gauge pages (0/1), fleet Temperature (2, added
+# 2026-08-23), the app menu (3), Settings (4), Select Target (5), and
+# Remote Control Help (6). Select Target and Remote Control Help used
+# to be separate "overlay_mode" full-screen states layered on top of
+# current_page, entered only via the TARGET/hamburger button or right
+# after a successful puppet assignment -- folded into the normal page
+# rotation 2026-08-17 so Left/Right alone can reach them too;
+# TARGET/hamburger and auto-jump-after-assign still work as fast-paths
+# into the same two page indices. Left/Right skips CONTROL_PAGE_INDEX
+# whenever monitor_target is LOCAL (see _cycle_page) -- relaying
+# keypresses to yourself doesn't mean anything, so that page only
+# exists in the rotation once a remote target is actually selected.
+# Settings (2026-08-18) is never skipped -- it's local to SCRUTE's own
+# display regardless of monitor_target, same as the app menu, and
+# neither is TEMPERATURE_PAGE_INDEX -- unlike every other page, it's
+# not scoped to monitor_target at all (see _build_temperature_page), so
+# there's no "nothing to show" case to skip past. Up/Down means "move
+# the menu/target cursor" on pages 3/5 and does nothing on the gauge or
+# temperature pages (removed 2026-08-16 in favor of TARGET/hamburger,
+# see _handle_gauge_page_keycode). Selecting an app on the menu page
+# acts on whichever machine is currently selected (self.monitor_target):
+# launches locally for LOCAL, assigns remotely via STRINGS for a puppet
+# -- and for a puppet, that assignment is also what puts you in live
+# control of it (see assign_to_puppet).
+TEMPERATURE_PAGE_INDEX = 2
+MENU_PAGE_INDEX = 3
+SETTINGS_PAGE_INDEX = 4
+TARGET_SELECT_PAGE_INDEX = 5
+CONTROL_PAGE_INDEX = 6
+PAGE_COUNT = 7
 PUPPET_POLL_TIMEOUT_SECONDS = 2
 PUPPET_POLL_INTERVAL_SECONDS = 3
 
@@ -1159,6 +1164,8 @@ class HealthApp:
             self._build_target_select_screen(canvas)
         elif self.current_page == SETTINGS_PAGE_INDEX:
             self._build_settings_page(canvas)
+        elif self.current_page == TEMPERATURE_PAGE_INDEX:
+            self._build_temperature_page(canvas)
         else:
             self.build_health_canvas(canvas)  # dispatches to the menu page internally for MENU_PAGE_INDEX
         if self.power_dialog_active:
@@ -1205,6 +1212,69 @@ class HealthApp:
         headline_surf = self.display._label_font.render(headline, True, PRIMARY_COLOR)
         row0_y = self.display.char_px(0, 0)[1]
         canvas.blit(headline_surf, ((FRAME_W - headline_surf.get_width()) // 2, row0_y))
+
+    def _build_temperature_page(self, canvas):
+        """TEMPERATURE_PAGE_INDEX (2026-08-23) -- the one page that
+        ignores self.monitor_target entirely: always shows all 5
+        McBrain machines at once, in their real physical stack order
+        (MP on top, P1-P4 below it, per the case's actual wiring), not
+        whichever single machine is currently selected elsewhere. Exists
+        because the middle of that stack runs measurably hotter than the
+        ends (sandwiched, drawing warmed air from both directions
+        instead of open ambient) -- P2/P3 have been seen in real ARM
+        soft-throttle from this before. Each row's temp/status comes
+        from the exact same source draw_cpu_panel already reads for a
+        single machine (self.poller.stats for LOCAL, RemotePoller's
+        cached STRINGS /status for a puppet), just laid out as a fixed
+        5-row table instead of one panel per selected target."""
+        canvas.fill(BLACK)
+        d = self.display
+
+        headline = "FLEET TEMPERATURE -- STACK ORDER"
+        headline_surf = d._label_font.render(headline, True, PRIMARY_COLOR)
+        row0_y = d.char_px(0, 0)[1]
+        canvas.blit(headline_surf, ((FRAME_W - headline_surf.get_width()) // 2, row0_y))
+
+        box_row = 2
+        box_rows = d._height - box_row
+        self.display.draw_panel_frame(canvas, Panel(
+            0, box_row, d._width, box_rows, "TEMPERATURE", subtitle="BY METAL SHOP"))
+
+        # (row label, monitor_target-style key) -- top-to-bottom order
+        # matches the physical case exactly, not MONITOR_TARGETS' own
+        # LOCAL-first ordering, since the whole point of this page is
+        # reading top-to-bottom against the real hardware in front of
+        # you.
+        STACK_ORDER = [("MP", "LOCAL"), ("P1", "P1"), ("P2", "P2"), ("P3", "P3"), ("P4", "P4")]
+
+        row = box_row + 2
+        for label, target in STACK_ORDER:
+            if target == "LOCAL":
+                stats, fresh = self.poller.stats, True
+            else:
+                stats, fresh = self.remote_poller.get(target)
+
+            x, y = d.char_px(2, row)
+            label_surf = d._font.render(label, True, PRIMARY_COLOR)
+            canvas.blit(label_surf, (x, y))
+
+            if not fresh or stats is None:
+                temp_text, status_text, status_color = "--", "OFFLINE", WARNING_COLOR
+            else:
+                temp = stats.get("cpu_temp")
+                temp_text = f"{temp * 9 / 5 + 32:.1f} F" if temp is not None else "N/A"
+                status_text = stats.get("throttled", "UNKNOWN")
+                status_color = PRIMARY_COLOR if status_text == "OK" else WARNING_COLOR
+
+            temp_x, _ = d.char_px(8, row)
+            temp_surf = d._font.render(f"{temp_text:>8}", True, PRIMARY_COLOR)
+            canvas.blit(temp_surf, (temp_x, y))
+
+            status_x, _ = d.char_px(20, row)
+            status_surf = d._font.render(status_text, True, status_color)
+            canvas.blit(status_surf, (status_x, y))
+
+            row += 1
 
     def _build_menu_page(self, canvas):
         """Page MENU_PAGE_INDEX -- selecting a row here acts on whichever
@@ -1605,16 +1675,20 @@ class HealthApp:
         self.current_page = page
 
     def _handle_gauge_page_keycode(self, code):
-        """Pages 0/1 (CPU/MEM, WIFI/NET). Left/Right is handled globally
-        now (see _cycle_page), before this is ever reached. Up/Down no
-        longer switches which machine is shown here (2026-08-16,
-        removed) -- that was the exact "confusing fast" behavior Select
-        Target replaced; monitor_target is now only ever changed via
-        TARGET/hamburger or the Select Target page (also handled
-        globally/via current_page, before this is ever reached). OK/
-        Enter no longer does anything on a gauge page either
-        (2026-08-16, removed) -- control mode is entered by picking an
-        app on the menu page now (see
+        """The dispatcher's catch-all -- reached for pages 0/1 (CPU/MEM,
+        WIFI/NET) and also TEMPERATURE_PAGE_INDEX (2026-08-23), which
+        needs the exact same "nothing but Back" handling and so was
+        never given its own keycode handler. Left/Right is handled
+        globally now (see _cycle_page), before this is ever reached.
+        Up/Down no longer switches which machine is shown here
+        (2026-08-16, removed) -- that was the exact "confusing fast"
+        behavior Select Target replaced; monitor_target is now only ever
+        changed via TARGET/hamburger or the Select Target page (also
+        handled globally/via current_page, before this is ever reached)
+        -- moot anyway on TEMPERATURE_PAGE_INDEX, which was never scoped
+        to monitor_target to begin with. OK/Enter no longer does
+        anything on a gauge page either (2026-08-16, removed) -- control
+        mode is entered by picking an app on the menu page now (see
         _activate_menu_selection/assign_to_puppet), not by a separate
         gesture on the stats pages. Home is handled globally now (see
         handle_keycode), so only Back reaches here."""
