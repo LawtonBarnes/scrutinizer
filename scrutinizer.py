@@ -1494,6 +1494,23 @@ class HealthApp:
             self.current_page = TARGET_SELECT_PAGE_INDEX
             self.target_selected = MONITOR_TARGETS.index(self.monitor_target)
             return True
+        if code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME):
+            # Home is unconditional (2026-08-23 redesign) -- always page
+            # 0, from any state, no exceptions, checked globally here
+            # same as TARGET/hamburger above instead of being handled
+            # (and special-cased) in each sub-handler below. Previously
+            # this was special-cased inside _handle_control_mode_keycode
+            # to jump to the target's app menu instead of page 0 --
+            # which meant Home didn't actually mean "home" in the one
+            # place a reliable panic button matters most. That job moved
+            # to BACK instead (see _handle_control_mode_keycode), which
+            # fits its "one step up" meaning better than Home's "always
+            # home" one anyway. Flash the control screen's own APPS box
+            # first if we're leaving it, mirroring TARGET's flash above.
+            if self.current_page == CONTROL_PAGE_INDEX:
+                self._flash_button(CONTROL_BUTTON_IDS.get(code))
+            self.current_page = 0
+            return True
         if code in (ecodes.KEY_Q, ecodes.KEY_ESC):
             self._quit_requested = True
         elif code == ecodes.KEY_POWER and self.current_page != CONTROL_PAGE_INDEX:
@@ -1577,29 +1594,34 @@ class HealthApp:
         (2026-08-16, removed) -- control mode is entered by picking an
         app on the menu page now (see
         _activate_menu_selection/assign_to_puppet), not by a separate
-        gesture on the stats pages."""
-        if code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME, ecodes.KEY_BACK):
-            self.current_page = 0  # Home always means "page 0" specifically now
+        gesture on the stats pages. Home is handled globally now (see
+        handle_keycode), so only Back reaches here."""
+        if code == ecodes.KEY_BACK:
+            self.current_page = 0
         else:
             return False
         return True
 
     def _handle_control_mode_keycode(self, code):
         """Active on CONTROL_PAGE_INDEX -- D-pad/OK/Vol/Power relay live
-        to monitor_target's running app (see _send_relay_key). House/
-        APPS (2026-08-16) exits to that same target's app menu -- freed
-        up by TARGET's move to a global hamburger binding (see
-        handle_keycode), so House inherited hamburger's old fast-path
-        job here. BACK exits all the way out to page 0 -- unless the
-        target is currently running bebop (2026-08-23), in which case
-        it's relayed instead, since bebop uses Back for in-app menu
-        navigation rather than "exit." Checked against RemotePoller's
-        last-known app for monitor_target (self.remote_poller.get),
-        same source _build_control_mode_screen already reads for the
-        "RUNNING: <app>" footer -- a stale/missing read (offline
-        puppet, no poll yet) just falls back to the ordinary exit
-        behavior, matching every other app. Q/Esc/TARGET/
-        Left/Right are already handled globally in handle_keycode
+        to monitor_target's running app (see _send_relay_key). Home is
+        handled globally now (see handle_keycode) -- always page 0,
+        unconditionally, same as every other page -- so it never
+        reaches here (2026-08-23 redesign: it used to be special-cased
+        here to jump to the target's app menu instead, which meant Home
+        didn't actually mean "home" while controlling a puppet, the one
+        place a reliable panic button matters most). BACK now carries
+        the "jump to the app menu" job Home used to have -- a one-
+        level-up motion (back to where you picked this app), not a jump
+        all the way to page 0 -- unless the target is currently running
+        bebop, in which case it's relayed instead, since bebop uses
+        Back for in-app menu navigation rather than "exit." Checked
+        against RemotePoller's last-known app for monitor_target
+        (self.remote_poller.get), same source _build_control_mode_screen
+        already reads for the "RUNNING: <app>" footer -- a stale/missing
+        read (offline puppet, no poll yet) just falls back to the
+        ordinary one-level-up behavior, matching every other app. Q/Esc/
+        TARGET/Left/Right are already handled globally in handle_keycode
         before this is ever reached -- Left/Right leaving this page is
         exactly what ends the relay (see _cycle_page), no separate
         "stop controlling" gesture needed. Power (2026-08-17) is
@@ -1607,22 +1629,19 @@ class HealthApp:
         handle_keycode's own KEY_POWER branch is skipped here on
         purpose so it falls through to the CONTROL_RELAY_KEYS branch
         below like any other relayed key. Every branch flashes its own
-        button box first (see _flash_button) -- for the two that exit
+        button box first (see _flash_button) -- for the one that exits
         this screen, that means one frame of the live-control screen
         with the box inverted, then the transition, same as TARGET's
         own flash in handle_keycode."""
         button_id = CONTROL_BUTTON_IDS.get(code)
-        if code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME):
-            self._flash_button(button_id)
-            self.current_page = MENU_PAGE_INDEX
-        elif code == ecodes.KEY_BACK:
+        if code == ecodes.KEY_BACK:
             stats, _fresh = self.remote_poller.get(self.monitor_target)
             if (stats or {}).get("app") == "bebop":
                 self._send_relay_key(code, key_name="KEY_BACK")
                 self._flash_button(button_id)
             else:
                 self._flash_button(button_id)
-                self.current_page = 0
+                self.current_page = MENU_PAGE_INDEX
         elif code in CONTROL_RELAY_KEYS:
             self._send_relay_key(code)
             self._flash_button(button_id)
@@ -1679,13 +1698,14 @@ class HealthApp:
         handle_keycode) from any state. Up/Down moves the cursor over
         MONITOR_TARGETS, OK picks it (sets monitor_target and jumps
         straight to that machine's app menu, mirroring
-        _activate_menu_selection's own landing choice). Back/Home goes
-        to page 0, same as every other page's Home/Back (2026-08-17 --
-        used to be a pure cancel back to whatever page you'd come from,
-        but that "remember the previous page" state doesn't have a
-        natural home now that this is a real page in the rotation
-        rather than an overlay on top of one)."""
-        if code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME, ecodes.KEY_BACK):
+        _activate_menu_selection's own landing choice). Back goes to
+        page 0 (Home is handled globally now, see handle_keycode, so
+        it never reaches here) -- used to be a pure cancel back to
+        whatever page you'd come from, but that "remember the previous
+        page" state doesn't have a natural home now that this is a
+        real page in the rotation rather than an overlay on top of one
+        (2026-08-17)."""
+        if code == ecodes.KEY_BACK:
             self.current_page = 0
         elif code == ecodes.KEY_UP:
             self.target_selected = (self.target_selected - 1) % len(MONITOR_TARGETS)
@@ -1907,8 +1927,9 @@ class HealthApp:
         machine this menu acts on) is changed via TARGET/hamburger or
         the Select Target page, not from here. Enter activates the
         highlighted row against monitor_target (see
-        _activate_menu_selection)."""
-        if code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME, ecodes.KEY_BACK):
+        _activate_menu_selection). Home is handled globally now (see
+        handle_keycode), so only Back reaches here."""
+        if code == ecodes.KEY_BACK:
             self.current_page = 0
         elif code == ecodes.KEY_UP:
             self.selected = (self.selected - 1) % len(APPS)
@@ -1931,8 +1952,10 @@ class HealthApp:
         Target's own Up/Down-then-OK convention exactly. OK commits the
         highlighted row -- applies it live and persists it -- moving the
         cursor alone does NOT change the active scheme, same as
-        highlighting an app on the menu page doesn't launch it."""
-        if code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME, ecodes.KEY_BACK):
+        highlighting an app on the menu page doesn't launch it. Home is
+        handled globally now (see handle_keycode), so only Back reaches
+        here."""
+        if code == ecodes.KEY_BACK:
             self.current_page = 0
         elif code == ecodes.KEY_UP:
             self.settings_selected = (self.settings_selected - 1) % len(COLOR_SCHEMES)
