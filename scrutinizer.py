@@ -148,12 +148,17 @@ PUPPET_PORT = 8420
 
 # Keycodes forwarded live to a puppet's running app in control mode (see
 # assign_to_puppet()) -- must match STRINGS's RELAY_KEYS allowlist by
-# name exactly. Deliberately excludes Home/Back/Q/Esc/Compose, which
-# stay local (exit control mode / open Select Target / control SCRUTE
+# name exactly. Deliberately excludes Home/Q/Esc/Compose, which stay
+# local (exit control mode / open Select Target / control SCRUTE
 # itself) rather than being relayed -- those mean "exit this app" in
 # every sibling app's own handle_keycode, so relaying them would
 # kill/restart whatever's running on the puppet instead of just
-# adjusting it. Power is relayed too (2026-08-17) -- see the dedicated
+# adjusting it. Back is a special case, handled separately in
+# _handle_control_mode_keycode rather than listed here -- bebop
+# (2026-08-23) is the first app where Back means "go up a menu level"
+# instead of "exit," so whether it's relayed or kept local now depends
+# on which app the target is actually running. Power is relayed too
+# (2026-08-17) -- see the dedicated
 # handling in handle_keycode(), which routes it here instead of opening
 # SCRUTE's own local power dialog whenever current_page ==
 # CONTROL_PAGE_INDEX, so the *target*'s confirm dialog shows on the
@@ -621,6 +626,17 @@ def check_internet():
         return False
 
 
+def check_mpd():
+    # bebop is an MPD client only -- its actual hardware dependency is
+    # "is MPD up and listening," same check STRINGS's own check_mpd
+    # duplicates for the puppet-side readiness field.
+    try:
+        with socket.create_connection(("localhost", 6600), timeout=1.5):
+            return True
+    except OSError:
+        return False
+
+
 # (key char, label, description, launcher command, main script -- read
 # for its own VERSION, hardware check -- None if the app has no
 # hardware dependency to poll for)
@@ -629,6 +645,7 @@ APPS = [
     ("2", "LOUDNESS", "Audio spectrum visualizer", "loudness", "/opt/loudness/loudness.py", check_loudness_mic),
     ("3", "WEATHERSTAR 4000", "Current conditions", "weatherstar", "/opt/weatherstar/weatherstar_launcher.py", check_internet),
     ("4", "CHANNEL 38", "Ole Miss sports ticker", "channel38", "/opt/channel38/channel38.py", check_internet),
+    ("5", "BEBOP", "MP3 player", "bebop", "/opt/bebop/bebop.py", check_mpd),
 ]
 
 HW_STATUS_LABELS = {
@@ -1573,7 +1590,15 @@ class HealthApp:
         APPS (2026-08-16) exits to that same target's app menu -- freed
         up by TARGET's move to a global hamburger binding (see
         handle_keycode), so House inherited hamburger's old fast-path
-        job here. BACK exits all the way out to page 0. Q/Esc/TARGET/
+        job here. BACK exits all the way out to page 0 -- unless the
+        target is currently running bebop (2026-08-23), in which case
+        it's relayed instead, since bebop uses Back for in-app menu
+        navigation rather than "exit." Checked against RemotePoller's
+        last-known app for monitor_target (self.remote_poller.get),
+        same source _build_control_mode_screen already reads for the
+        "RUNNING: <app>" footer -- a stale/missing read (offline
+        puppet, no poll yet) just falls back to the ordinary exit
+        behavior, matching every other app. Q/Esc/TARGET/
         Left/Right are already handled globally in handle_keycode
         before this is ever reached -- Left/Right leaving this page is
         exactly what ends the relay (see _cycle_page), no separate
@@ -1591,8 +1616,13 @@ class HealthApp:
             self._flash_button(button_id)
             self.current_page = MENU_PAGE_INDEX
         elif code == ecodes.KEY_BACK:
-            self._flash_button(button_id)
-            self.current_page = 0
+            stats, _fresh = self.remote_poller.get(self.monitor_target)
+            if (stats or {}).get("app") == "bebop":
+                self._send_relay_key(code, key_name="KEY_BACK")
+                self._flash_button(button_id)
+            else:
+                self._flash_button(button_id)
+                self.current_page = 0
         elif code in CONTROL_RELAY_KEYS:
             self._send_relay_key(code)
             self._flash_button(button_id)
@@ -1616,15 +1646,19 @@ class HealthApp:
         time.sleep(BUTTON_FLASH_SECONDS)
         self.last_pressed_button = None
 
-    def _send_relay_key(self, code):
+    def _send_relay_key(self, code, key_name=None):
         """POSTs one keypress to monitor_target's STRINGS /input -- same
         blocking, short-timeout, HTTPError-vs-OSError shape every other
         SCRUTE-to-puppet call already uses (see assign_to_puppet). A
         failed send just updates the on-screen indicator; it doesn't
         exit the control page, since a single dropped packet on a flaky
         connection shouldn't kick you out of what could still be a
-        perfectly usable session."""
-        key_name = CONTROL_RELAY_KEYS[code]
+        perfectly usable session. key_name lets a caller override the
+        CONTROL_RELAY_KEYS lookup -- needed for KEY_BACK, which isn't
+        in that dict since it's only conditionally relayed (see
+        _handle_control_mode_keycode)."""
+        if key_name is None:
+            key_name = CONTROL_RELAY_KEYS[code]
         ip = dict(PUPPETS)[self.monitor_target]
         try:
             req = urllib.request.Request(
