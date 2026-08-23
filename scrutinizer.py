@@ -645,7 +645,10 @@ APPS = [
     ("2", "LOUDNESS", "Audio spectrum visualizer", "loudness", "/opt/loudness/loudness.py", check_loudness_mic),
     ("3", "WEATHERSTAR 4000", "Current conditions", "weatherstar", "/opt/weatherstar/weatherstar_launcher.py", check_internet),
     ("4", "CHANNEL 38", "Ole Miss sports ticker", "channel38", "/opt/channel38/channel38.py", check_internet),
-    ("5", "BEBOP", "MP3 player", "bebop", "/opt/bebop/bebop.py", check_mpd),
+    # Points at menu.py, not bebop.py, for its VERSION scan -- bebop.py
+    # itself re-exports VERSION from menu.py (`VERSION = menu.VERSION`,
+    # not a quoted literal), which read_app_version's regex can't match.
+    ("5", "BEBOP", "MP3 player", "bebop", "/opt/bebop/menu.py", check_mpd),
 ]
 
 HW_STATUS_LABELS = {
@@ -1211,11 +1214,17 @@ class HealthApp:
         assign_to_puppet()). Hardware-readiness (HARDWARE NOT FOUND)
         comes from that same machine -- self.hardware_status for LOCAL,
         the puppet's own STRINGS-reported `hardware` field otherwise, so
-        it reflects what's actually attached *there*, not to MP."""
+        it reflects what's actually attached *there*, not to MP. Each
+        app's version number (2026-08-23) follows the same split --
+        read straight off MP's own local copy for LOCAL, off the
+        puppet's own STRINGS-reported `versions` field otherwise, since
+        MP frequently doesn't have a given app installed locally at all
+        (BEBOP, WEATHERSTAR) even when every puppet does."""
         canvas.fill(BLACK)
         d = self.display
 
         hardware_status = self._current_hardware_status()
+        stats = None  # only ever populated for a remote target, see below
         if self.monitor_target == "LOCAL":
             title = f"CENTRAL SCRUTINIZER {VERSION}".upper()
             target_label = self.hostname
@@ -1235,8 +1244,6 @@ class HealthApp:
         headline_surf = d._label_font.render(headline, True, PRIMARY_COLOR)
         row0_y = d.char_px(0, 0)[1]
         canvas.blit(headline_surf, ((FRAME_W - headline_surf.get_width()) // 2, row0_y))
-
-        rows_per_app = 2  # label+version row, description row
 
         # box_row leaves one blank row between the headline and the box
         # (2026-08-15, cosmetic per user request). box_rows now fills
@@ -1258,6 +1265,25 @@ class HealthApp:
         for idx in range(len(APPS)):
             selected = idx == self.selected
             text_color = BLACK if selected else PRIMARY_COLOR
+
+            _key, label, _desc, cmd, script_path, _hw_check = APPS[idx]
+            # A remote target's own STRINGS-reported `versions` field
+            # (2026-08-23) reflects what's actually installed *there* --
+            # reading script_path locally would only ever show MP's own
+            # copy (often not installed at all, e.g. BEBOP/WEATHERSTAR),
+            # regardless of which puppet is actually being assigned to.
+            if self.monitor_target == "LOCAL":
+                app_version = read_app_version(script_path)
+            else:
+                app_version = (stats or {}).get("versions", {}).get(cmd, "?")
+            hw_status = hardware_status.get(cmd, "ready")
+            hw_ok = hw_status == "ready"
+            # One row normally; a second only when there's a hardware-
+            # readiness warning to show under it (2026-08-23, per user
+            # request to drop the always-blank second row now that the
+            # plain description no longer renders here at all).
+            row_height = 1 if hw_ok else 2
+
             highlight_x, px_y = d.char_px(1, row)
             px_x = highlight_x + d._char_w  # one extra space between the border/highlight and the text
             if selected:
@@ -1269,21 +1295,10 @@ class HealthApp:
                 HIGHLIGHT_GAP = 4
                 pygame.draw.rect(canvas, PRIMARY_COLOR, (
                     highlight_x + HIGHLIGHT_GAP, px_y - 2,
-                    highlight_w - 2 * HIGHLIGHT_GAP, d._char_h * 2 + 2))
+                    highlight_w - 2 * HIGHLIGHT_GAP, d._char_h * row_height + 2))
 
-            _key, label, _desc, cmd, script_path, _hw_check = APPS[idx]
-            app_version = read_app_version(script_path)
             line = d._font.render(f"{label} {app_version}".upper(), True, text_color)
             canvas.blit(line, (px_x, px_y))
-            hw_status = hardware_status.get(cmd, "ready")
-            hw_ok = hw_status == "ready"
-            # Second row is reserved for a hardware-readiness warning
-            # only (2026-08-23, per user request) -- the plain
-            # description text no longer renders here at all, just
-            # title+version above and blank space below when hardware's
-            # fine. The warning is kept, unlike the description, since
-            # it's functional information (this app genuinely can't run
-            # here right now), not decorative.
             if not hw_ok:
                 warning_text = HW_STATUS_LABELS.get(hw_status, "HARDWARE NOT FOUND")
                 # Selected row's highlight stays BLACK like the rest of
@@ -1293,7 +1308,7 @@ class HealthApp:
                 warning_color = text_color if selected else WARNING_COLOR
                 warning_line = d._font.render(warning_text, True, warning_color)
                 canvas.blit(warning_line, (px_x + d._char_w * 2, px_y + d._char_h))
-            row += rows_per_app
+            row += row_height
 
     def draw_power_dialog(self, canvas):
         lines = ["ARE YOU SURE YOU WANT", "TO SHUT DOWN?"]
