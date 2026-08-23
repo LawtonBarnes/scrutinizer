@@ -1271,21 +1271,28 @@ class HealthApp:
                     highlight_x + HIGHLIGHT_GAP, px_y - 2,
                     highlight_w - 2 * HIGHLIGHT_GAP, d._char_h * 2 + 2))
 
-            _key, label, desc, cmd, script_path, _hw_check = APPS[idx]
+            _key, label, _desc, cmd, script_path, _hw_check = APPS[idx]
             app_version = read_app_version(script_path)
             line = d._font.render(f"{label} {app_version}".upper(), True, text_color)
             canvas.blit(line, (px_x, px_y))
             hw_status = hardware_status.get(cmd, "ready")
             hw_ok = hw_status == "ready"
-            desc_text = desc.upper() if hw_ok else HW_STATUS_LABELS.get(hw_status, "HARDWARE NOT FOUND")
-            # The warning color reads clearly against the black page
-            # background; on the selected row's highlight it stays BLACK
-            # like the rest of that row's text instead -- warning-on-fill
-            # is low contrast for every scheme, and the text itself
-            # already reads as a warning.
-            desc_color = text_color if (hw_ok or selected) else WARNING_COLOR
-            desc_line = d._font.render(desc_text, True, desc_color)
-            canvas.blit(desc_line, (px_x + d._char_w * 2, px_y + d._char_h))
+            # Second row is reserved for a hardware-readiness warning
+            # only (2026-08-23, per user request) -- the plain
+            # description text no longer renders here at all, just
+            # title+version above and blank space below when hardware's
+            # fine. The warning is kept, unlike the description, since
+            # it's functional information (this app genuinely can't run
+            # here right now), not decorative.
+            if not hw_ok:
+                warning_text = HW_STATUS_LABELS.get(hw_status, "HARDWARE NOT FOUND")
+                # Selected row's highlight stays BLACK like the rest of
+                # that row's text instead of the warning color --
+                # warning-on-fill is low contrast for every scheme, and
+                # the text itself already reads as a warning.
+                warning_color = text_color if selected else WARNING_COLOR
+                warning_line = d._font.render(warning_text, True, warning_color)
+                canvas.blit(warning_line, (px_x + d._char_w * 2, px_y + d._char_h))
             row += rows_per_app
 
     def draw_power_dialog(self, canvas):
