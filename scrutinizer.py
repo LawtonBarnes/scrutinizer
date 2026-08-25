@@ -582,10 +582,10 @@ LOUDNESS_DEVICE_RE = re.compile(r"^device\s*=\s*plughw:(\d+),(\d+)", re.MULTILIN
 
 
 def check_sdr_dongle():
-    # Unused now that retro-radar is retired (moved aside, not deleted --
-    # see the *.retired-20260814 paths -- user's plan is to revisit it
-    # later). Kept rather than removed so re-adding retro-radar to APPS
-    # doesn't require reconstructing this check.
+    # Was unused after retro-radar was retired (see the *.retired-20260814
+    # paths); back in use 2026-08-25 for JOAN JETT, its from-scratch
+    # replacement -- same underlying readsb dependency, so this check
+    # needed no changes at all, just a new APPS row pointing at it.
     #
     # There's no software-visible signal for "an antenna is attached" --
     # this only confirms readsb has successfully claimed an RTL-SDR
@@ -654,6 +654,9 @@ APPS = [
     # itself re-exports VERSION from menu.py (`VERSION = menu.VERSION`,
     # not a quoted literal), which read_app_version's regex can't match.
     ("5", "BEBOP", "MP3 player", "bebop", "/opt/bebop/menu.py", check_mpd),
+    # Same reason as BEBOP above -- points at config.py, not main.py, for
+    # its VERSION scan (main.py does `VERSION = config.VERSION`).
+    ("6", "JOAN JETT", "ADS-B radar", "joanjett", "/opt/joanjett/config.py", check_sdr_dongle),
 ]
 
 HW_STATUS_LABELS = {
