@@ -59,7 +59,7 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
 import pygame  # noqa: E402  (must come after SDL env vars are set)
 
-VERSION = "2.8"
+VERSION = "2.9"
 
 BASE_DIR = Path(__file__).resolve().parent
 FONT_PATH = BASE_DIR / "VCR_OSD_MONO_1.001.ttf"
@@ -157,17 +157,12 @@ PUPPET_PORT = 8420
 # _handle_control_mode_keycode rather than listed here -- bebop
 # (2026-08-23) is the first app where Back means "go up a menu level"
 # instead of "exit," so whether it's relayed or kept local now depends
-# on which app the target is actually running. Power is relayed too
-# (2026-08-17) -- see the dedicated
-# handling in handle_keycode(), which routes it here instead of opening
-# SCRUTE's own local power dialog whenever current_page ==
-# CONTROL_PAGE_INDEX, so the *target*'s confirm dialog shows on the
-# machine you're actually controlling. This only became safe to relay
-# once every fleet
-# machine's logind stopped independently reacting to a raw KEY_POWER
-# event (HandlePowerKey=ignore) -- otherwise the relayed keypress would
-# instantly power off the puppet before its own app dialog ever showed,
-# the same bug this whole change stemmed from on MP itself.
+# on which app the target is actually running. Power used to be relayed
+# too (2026-08-17), so the *target*'s own confirm dialog showed on the
+# machine you're actually controlling -- removed 2026-08-27 when Power
+# became a fleet-wide, always-global action instead (see handle_keycode's
+# own unconditional KEY_POWER check and broadcast_power_action()), so it
+# no longer belongs in this per-target relay set at all.
 CONTROL_RELAY_KEYS = {
     ecodes.KEY_UP: "KEY_UP",
     ecodes.KEY_DOWN: "KEY_DOWN",
@@ -177,7 +172,6 @@ CONTROL_RELAY_KEYS = {
     ecodes.KEY_KPENTER: "KEY_ENTER",
     ecodes.KEY_VOLUMEUP: "KEY_VOLUMEUP",
     ecodes.KEY_VOLUMEDOWN: "KEY_VOLUMEDOWN",
-    ecodes.KEY_POWER: "KEY_POWER",
 }
 
 # On-screen labels for the live-control screen's D-pad boxes (2026-08-16).
@@ -1384,7 +1378,7 @@ class HealthApp:
             row += row_height
 
     def draw_power_dialog(self, canvas):
-        lines = ["ARE YOU SURE YOU WANT", "TO SHUT DOWN?"]
+        lines = ["ARE YOU SURE YOU WANT TO", "SHUT DOWN THE WHOLE FLEET?"]
         line_surfs = [self.osd_font.render(line, True, PRIMARY_COLOR) for line in lines]
         option_surfs = [
             self.option_font.render(opt, True, BLACK if i == self.power_dialog_selection else PRIMARY_COLOR)
@@ -1606,19 +1600,26 @@ class HealthApp:
                 self._flash_button(CONTROL_BUTTON_IDS.get(code))
             self.current_page = 0
             return True
-        if code in (ecodes.KEY_Q, ecodes.KEY_ESC):
-            self._quit_requested = True
-        elif code == ecodes.KEY_POWER and self.current_page != CONTROL_PAGE_INDEX:
-            # Only opens SCRUTE's own local dialog outside the control
-            # page -- while controlling a remote target, Power falls
-            # through to the CONTROL_PAGE_INDEX branch below instead,
-            # which relays it (now in CONTROL_RELAY_KEYS) so the
-            # *target*'s own confirm dialog shows on the machine
-            # actually being controlled, not on MP. See
-            # CONTROL_RELAY_KEYS's comment for why this needed
-            # HandlePowerKey=ignore fleet-wide first.
+        if code == ecodes.KEY_POWER:
+            # Power is unconditional and fleet-wide (2026-08-27 redesign)
+            # -- always opens SCRUTE's own local confirm dialog, from any
+            # page, including CONTROL_PAGE_INDEX (previously relayed
+            # there instead, via CONTROL_RELAY_KEYS, to show the
+            # *target*'s own single-app dialog on whichever puppet was
+            # selected -- removed, since Power now means "take down the
+            # whole fleet at once," not one machine). See
+            # broadcast_power_action() for how MP reaches every other
+            # machine once the dialog is confirmed. Flash the control
+            # screen's own box first if we're leaving it, same as
+            # TARGET/Home above (currently a no-op -- CONTROL_BUTTON_IDS
+            # has no entry for Power, no on-screen D-pad box for it).
+            if self.current_page == CONTROL_PAGE_INDEX:
+                self._flash_button(CONTROL_BUTTON_IDS.get(code))
             self.power_dialog_active = True
             self.power_dialog_selection = 0
+            return True
+        if code in (ecodes.KEY_Q, ecodes.KEY_ESC):
+            self._quit_requested = True
         elif code == ecodes.KEY_LEFT and self.current_page != CONTROL_PAGE_INDEX:
             self._cycle_page(-1)
         elif code == ecodes.KEY_RIGHT and self.current_page != CONTROL_PAGE_INDEX:
@@ -1702,8 +1703,8 @@ class HealthApp:
         return True
 
     def _handle_control_mode_keycode(self, code):
-        """Active on CONTROL_PAGE_INDEX -- D-pad/OK/Vol/Power relay live
-        to monitor_target's running app (see _send_relay_key). Home is
+        """Active on CONTROL_PAGE_INDEX -- D-pad/OK/Vol relay live to
+        monitor_target's running app (see _send_relay_key). Home is
         handled globally now (see handle_keycode) -- always page 0,
         unconditionally, same as every other page -- so it never
         reaches here (2026-08-23 redesign: it used to be special-cased
@@ -1720,16 +1721,14 @@ class HealthApp:
         already reads for the "RUNNING: <app>" footer -- a stale/missing
         read (offline puppet, no poll yet) just falls back to the
         ordinary one-level-up behavior, matching every other app. Q/Esc/
-        TARGET/Left/Right are already handled globally in handle_keycode
-        before this is ever reached -- Left/Right leaving this page is
-        exactly what ends the relay (see _cycle_page), no separate
-        "stop controlling" gesture needed. Power (2026-08-17) is
-        deliberately NOT handled globally while on this page --
-        handle_keycode's own KEY_POWER branch is skipped here on
-        purpose so it falls through to the CONTROL_RELAY_KEYS branch
-        below like any other relayed key. Every branch flashes its own
-        button box first (see _flash_button) -- for the one that exits
-        this screen, that means one frame of the live-control screen
+        TARGET/Left/Right/Power are already handled globally in
+        handle_keycode before this is ever reached -- Left/Right leaving
+        this page is exactly what ends the relay (see _cycle_page), no
+        separate "stop controlling" gesture needed; Power (fleet-wide as
+        of 2026-08-27) never reaches here at all anymore, unlike its
+        pre-2026-08-27 single-target-relay design. Every branch flashes
+        its own button box first (see _flash_button) -- for the one
+        that exits this screen, that means one frame of the live-control screen
         with the box inverted, then the transition, same as TARGET's
         own flash in handle_keycode."""
         button_id = CONTROL_BUTTON_IDS.get(code)
@@ -1789,6 +1788,31 @@ class HealthApp:
             self.control_mode_last_result = "OK"
         except (urllib.error.HTTPError, OSError):
             self.control_mode_last_result = "UNREACHABLE"
+
+    def broadcast_power_action(self, action):
+        """Fire-and-forget fleet-wide shutdown/restart broadcast to
+        every puppet's STRINGS /power endpoint (2026-08-27) -- called
+        from run()'s tail right before MP shuts/restarts itself, since
+        MP is the last machine standing once its own
+        subprocess.run(["sudo", "shutdown", ...]) call there runs.
+        PUPPETS already covers P1-P4 and PRODUCTION (folded in as a real
+        STRINGS target 2026-08-16), so this reaches all 5 other fleet
+        machines with no special-casing. Short per-host timeout and
+        swallowed errors, same shape as _send_relay_key/assign_to_puppet
+        -- an unreachable/offline puppet shouldn't block the rest of the
+        fleet or delay MP's own shutdown, which is the one that actually
+        matters most to the person standing in front of the remote."""
+        for _name, ip in PUPPETS:
+            try:
+                req = urllib.request.Request(
+                    f"http://{ip}:{PUPPET_PORT}/power",
+                    data=json.dumps({"action": action}).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                urllib.request.urlopen(req, timeout=2)
+            except (urllib.error.HTTPError, OSError):
+                pass
 
     def _handle_target_select_keycode(self, code):
         """Active on TARGET_SELECT_PAGE_INDEX -- reachable by paging
@@ -2169,6 +2193,11 @@ class HealthApp:
                 os.close(self.tty_fd)
             pygame.quit()
 
+        if self.pending_power_action in ("shutdown", "restart"):
+            # Broadcast to the rest of the fleet first -- MP's own
+            # shutdown below is a one-way trip, so this is the last
+            # chance to reach anyone else.
+            self.broadcast_power_action(self.pending_power_action)
         if self.pending_power_action == "shutdown":
             subprocess.run(["sudo", "shutdown", "-h", "now"])
         elif self.pending_power_action == "restart":
