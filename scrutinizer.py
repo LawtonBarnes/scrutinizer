@@ -59,7 +59,7 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
 import pygame  # noqa: E402  (must come after SDL env vars are set)
 
-VERSION = "2.9"
+VERSION = "3.0"
 
 BASE_DIR = Path(__file__).resolve().parent
 FONT_PATH = BASE_DIR / "VCR_OSD_MONO_1.001.ttf"
@@ -74,16 +74,26 @@ TARGET_WIDTH = 40
 
 BLACK = (0, 0, 0)
 
+# Fixed status colors for the MCBRAIN STATUS page's per-machine status
+# column -- deliberately NOT PRIMARY_COLOR/WARNING_COLOR (those follow
+# the active COLOR_SCHEMES entry and would make OK/error unreadable
+# against each other under AMBER ALERT or GREEN MANALISHI). NOIR is the
+# one exception: its whole point is a monochrome look, so status text
+# goes plain white there instead of green/red.
+STATUS_GREEN = (0x00, 0xFF, 0x00)
+STATUS_RED = (220, 30, 30)
+STATUS_WHITE = (0xFF, 0xFF, 0xFF)
+
 # Three selectable color schemes (name, primary, warning) -- the Settings
-# page's COLOR: row cycles through these via apply_color_scheme(). RED
-# stays the warning color for both ORANGE and GREEN (still reads as
-# "alert" against either), but WHITE gets a GRAY warning instead since
-# red-on-white doesn't read as distinctly different from the rest of the
-# (also-bright) body text the way red-on-black/red-on-green does.
+# page's APPEARANCE list cycles through these via apply_color_scheme(). RED
+# stays the warning color for both AMBER ALERT and GREEN MANALISHI (still
+# reads as "alert" against either), but NOIR gets a GRAY warning instead
+# since red-on-white doesn't read as distinctly different from the rest of
+# the (also-bright) body text the way red-on-black/red-on-green does.
 COLOR_SCHEMES = [
-    ("ORANGE", (0xFF, 0xA5, 0x00), (220, 30, 30)),
-    ("GREEN", (0x00, 0xFF, 0x00), (220, 30, 30)),
-    ("WHITE", (0xFF, 0xFF, 0xFF), (160, 160, 160)),
+    ("AMBER ALERT", (0xFF, 0xA5, 0x00), (220, 30, 30)),
+    ("GREEN MANALISHI", (0x00, 0xFF, 0x00), (220, 30, 30)),
+    ("NOIR", (0xFF, 0xFF, 0xFF), (160, 160, 160)),
 ]
 DEFAULT_COLOR_SCHEME_INDEX = 0
 
@@ -209,37 +219,41 @@ CONTROL_BUTTON_IDS = {
 # etc.) -- imperceptible for a single keypress.
 BUTTON_FLASH_SECONDS = 0.15
 
-# Seven pages in one Left/Right rotation, all handled by the same
+# Eight pages in one Left/Right rotation, all handled by the same
 # current_page int -- gauge pages (0/1), fleet Temperature (2, added
-# 2026-08-23), the app menu (3), Settings (4), Select Target (5), and
-# Remote Control Help (6). Select Target and Remote Control Help used
-# to be separate "overlay_mode" full-screen states layered on top of
-# current_page, entered only via the TARGET/hamburger button or right
-# after a successful puppet assignment -- folded into the normal page
-# rotation 2026-08-17 so Left/Right alone can reach them too;
-# TARGET/hamburger and auto-jump-after-assign still work as fast-paths
-# into the same two page indices. Left/Right skips CONTROL_PAGE_INDEX
-# whenever monitor_target is LOCAL (see _cycle_page) -- relaying
-# keypresses to yourself doesn't mean anything, so that page only
-# exists in the rotation once a remote target is actually selected.
-# Settings (2026-08-18) is never skipped -- it's local to SCRUTE's own
-# display regardless of monitor_target, same as the app menu, and
-# neither is TEMPERATURE_PAGE_INDEX -- unlike every other page, it's
-# not scoped to monitor_target at all (see _build_temperature_page), so
-# there's no "nothing to show" case to skip past. Up/Down means "move
-# the menu/target cursor" on pages 3/5 and does nothing on the gauge or
-# temperature pages (removed 2026-08-16 in favor of TARGET/hamburger,
-# see _handle_gauge_page_keycode). Selecting an app on the menu page
-# acts on whichever machine is currently selected (self.monitor_target):
-# launches locally for LOCAL, assigns remotely via STRINGS for a puppet
-# -- and for a puppet, that assignment is also what puts you in live
-# control of it (see assign_to_puppet).
+# 2026-08-23), fleet Processes (3, added 2026-08-31), the app menu (4),
+# Settings (5), Select Target (6), and Remote Control Help (7). Select
+# Target and Remote Control Help used to be separate "overlay_mode"
+# full-screen states layered on top of current_page, entered only via
+# the TARGET/hamburger button or right after a successful puppet
+# assignment -- folded into the normal page rotation 2026-08-17 so
+# Left/Right alone can reach them too; TARGET/hamburger and
+# auto-jump-after-assign still work as fast-paths into the same two
+# page indices. Left/Right skips CONTROL_PAGE_INDEX whenever
+# monitor_target is LOCAL (see _cycle_page) -- relaying keypresses to
+# yourself doesn't mean anything, so that page only exists in the
+# rotation once a remote target is actually selected. Settings
+# (2026-08-18) is never skipped -- it's local to SCRUTE's own display
+# regardless of monitor_target, same as the app menu, and neither is
+# TEMPERATURE_PAGE_INDEX or PROCESSES_PAGE_INDEX -- unlike every other
+# page, they're not scoped to monitor_target at all (see
+# _build_temperature_page/_build_processes_page), so there's no
+# "nothing to show" case to skip past. Up/Down means "move the
+# menu/target cursor" on the menu/target-select pages and does nothing
+# on the gauge, temperature, or processes pages (removed 2026-08-16 in
+# favor of TARGET/hamburger, see _handle_gauge_page_keycode). Selecting
+# an app on the menu page acts on whichever machine is currently
+# selected (self.monitor_target): launches locally for LOCAL, assigns
+# remotely via STRINGS for a puppet -- and for a puppet, that
+# assignment is also what puts you in live control of it (see
+# assign_to_puppet).
 TEMPERATURE_PAGE_INDEX = 2
-MENU_PAGE_INDEX = 3
-SETTINGS_PAGE_INDEX = 4
-TARGET_SELECT_PAGE_INDEX = 5
-CONTROL_PAGE_INDEX = 6
-PAGE_COUNT = 7
+PROCESSES_PAGE_INDEX = 3
+MENU_PAGE_INDEX = 4
+SETTINGS_PAGE_INDEX = 5
+TARGET_SELECT_PAGE_INDEX = 6
+CONTROL_PAGE_INDEX = 7
+PAGE_COUNT = 8
 PUPPET_POLL_TIMEOUT_SECONDS = 2
 PUPPET_POLL_INTERVAL_SECONDS = 3
 
@@ -577,7 +591,7 @@ LOUDNESS_DEVICE_RE = re.compile(r"^device\s*=\s*plughw:(\d+),(\d+)", re.MULTILIN
 
 def check_sdr_dongle():
     # Was unused after retro-radar was retired (see the *.retired-20260814
-    # paths); back in use 2026-08-25 for JOAN JETT, its from-scratch
+    # paths); back in use 2026-08-25 for JOAN JET, its from-scratch
     # replacement -- same underlying readsb dependency, so this check
     # needed no changes at all, just a new APPS row pointing at it.
     #
@@ -650,7 +664,7 @@ APPS = [
     ("5", "BEBOP", "MP3 player", "bebop", "/opt/bebop/menu.py", check_mpd),
     # Same reason as BEBOP above -- points at config.py, not main.py, for
     # its VERSION scan (main.py does `VERSION = config.VERSION`).
-    ("6", "JOAN JETT", "ADS-B radar", "joanjett", "/opt/joanjett/config.py", check_sdr_dongle),
+    ("6", "JOAN JET", "ADS-B radar", "joanjett", "/opt/joanjett/config.py", check_sdr_dongle),
 ]
 
 HW_STATUS_LABELS = {
@@ -995,9 +1009,6 @@ class HealthApp:
         self.display = HealthDisplay(self.fb)
         self.poller = StatsPoller()
 
-        self.osd_font = pygame.font.Font(str(FONT_PATH), 32)
-        self.option_font = pygame.font.Font(str(FONT_PATH), 28)
-
         # No more separate "screen" concept -- the app menu is just page
         # index MENU_PAGE_INDEX of self.current_page now (2026-08-15
         # redesign). Switching pages is just updating that int + a
@@ -1163,6 +1174,8 @@ class HealthApp:
             self._build_settings_page(canvas)
         elif self.current_page == TEMPERATURE_PAGE_INDEX:
             self._build_temperature_page(canvas)
+        elif self.current_page == PROCESSES_PAGE_INDEX:
+            self._build_processes_page(canvas)
         else:
             self.build_health_canvas(canvas)  # dispatches to the menu page internally for MENU_PAGE_INDEX
         if self.power_dialog_active:
@@ -1227,7 +1240,7 @@ class HealthApp:
         canvas.fill(BLACK)
         d = self.display
 
-        headline = "FLEET TEMPERATURE -- STACK ORDER"
+        headline = "MCBRAIN STATUS"
         headline_surf = d._label_font.render(headline, True, PRIMARY_COLOR)
         row0_y = d.char_px(0, 0)[1]
         canvas.blit(headline_surf, ((FRAME_W - headline_surf.get_width()) // 2, row0_y))
@@ -1237,39 +1250,109 @@ class HealthApp:
         self.display.draw_panel_frame(canvas, Panel(
             0, box_row, d._width, box_rows, "TEMPERATURE", subtitle="BY METAL SHOP"))
 
-        # (row label, monitor_target-style key) -- top-to-bottom order
+        # (fallback label, monitor_target-style key) -- top-to-bottom order
         # matches the physical case exactly, not MONITOR_TARGETS' own
         # LOCAL-first ordering, since the whole point of this page is
         # reading top-to-bottom against the real hardware in front of
-        # you.
+        # you. The fallback label is only used if a puppet is offline
+        # and its real hostname was never cached.
         STACK_ORDER = [("MP", "LOCAL"), ("P1", "P1"), ("P2", "P2"), ("P3", "P3"), ("P4", "P4")]
 
+        is_noir = COLOR_SCHEMES[self.color_scheme_index][0] == "NOIR"
+
         row = box_row + 2
-        for label, target in STACK_ORDER:
+        for fallback_label, target in STACK_ORDER:
             if target == "LOCAL":
                 stats, fresh = self.poller.stats, True
+                hostname = self.hostname
             else:
                 stats, fresh = self.remote_poller.get(target)
+                hostname = (stats or {}).get("hostname", fallback_label).upper()
 
             x, y = d.char_px(2, row)
-            label_surf = d._font.render(label, True, PRIMARY_COLOR)
+            label_surf = d._font.render(hostname[:8], True, PRIMARY_COLOR)
             canvas.blit(label_surf, (x, y))
 
             if not fresh or stats is None:
-                temp_text, status_text, status_color = "--", "OFFLINE", WARNING_COLOR
+                temp_text, status_text = "--", "OFFLINE"
             else:
                 temp = stats.get("cpu_temp")
                 temp_text = f"{temp * 9 / 5 + 32:.1f} F" if temp is not None else "N/A"
                 status_text = stats.get("throttled", "UNKNOWN")
-                status_color = PRIMARY_COLOR if status_text == "OK" else WARNING_COLOR
 
-            temp_x, _ = d.char_px(8, row)
+            if is_noir:
+                status_color = STATUS_WHITE
+            elif status_text == "OK":
+                status_color = STATUS_GREEN
+            else:
+                status_color = STATUS_RED
+
+            temp_x, _ = d.char_px(11, row)
             temp_surf = d._font.render(f"{temp_text:>8}", True, PRIMARY_COLOR)
             canvas.blit(temp_surf, (temp_x, y))
 
             status_x, _ = d.char_px(20, row)
             status_surf = d._font.render(status_text, True, status_color)
             canvas.blit(status_surf, (status_x, y))
+
+            row += 1
+
+    def _build_processes_page(self, canvas):
+        """PROCESSES_PAGE_INDEX (2026-08-31) -- same shape as
+        _build_temperature_page (fixed McBrain stack order, ignores
+        self.monitor_target entirely), showing what each machine is
+        actually running instead of its temperature. MP's row is a
+        special case: STRINGS-reported `app`/`versions` only exist for
+        a puppet, since MP runs an app by blocking synchronously in
+        launch_app() -- while that's happening SCRUTE itself isn't
+        drawing frames, so there's never a moment where this screen is
+        visible AND something else is genuinely running locally. SCRUTE
+        itself is what's always active on MP whenever this page is on
+        screen, so that's what its row reports (own hostname/VERSION,
+        not a lookup)."""
+        canvas.fill(BLACK)
+        d = self.display
+
+        headline = "MCBRAIN PROCESSES"
+        headline_surf = d._label_font.render(headline, True, PRIMARY_COLOR)
+        row0_y = d.char_px(0, 0)[1]
+        canvas.blit(headline_surf, ((FRAME_W - headline_surf.get_width()) // 2, row0_y))
+
+        box_row = 2
+        box_rows = d._height - box_row
+        self.display.draw_panel_frame(canvas, Panel(
+            0, box_row, d._width, box_rows, "ACTIVE", subtitle="BY METAL SHOP"))
+
+        # (fallback label, monitor_target-style key) -- same physical
+        # stack order as _build_temperature_page's STACK_ORDER.
+        STACK_ORDER = [("MP", "LOCAL"), ("P1", "P1"), ("P2", "P2"), ("P3", "P3"), ("P4", "P4")]
+
+        row = box_row + 2
+        for fallback_label, target in STACK_ORDER:
+            if target == "LOCAL":
+                hostname = self.hostname
+                active_text = f"CENTRAL SCRUTINIZER {VERSION}".upper()
+            else:
+                stats, fresh = self.remote_poller.get(target)
+                hostname = (stats or {}).get("hostname", fallback_label).upper()
+                if not fresh or stats is None:
+                    active_text = "OFFLINE"
+                else:
+                    app_cmd = stats.get("app")
+                    if app_cmd:
+                        app_label = next(
+                            (label for _key, label, _desc, cmd, *_ in APPS if cmd == app_cmd),
+                            app_cmd.upper(),
+                        )
+                        app_version = stats.get("versions", {}).get(app_cmd, "?")
+                        active_text = f"{app_label} {app_version}".upper()
+                    else:
+                        active_text = "NONE"
+
+            line = f"{hostname[:8]} - {active_text}"
+            x, y = d.char_px(2, row)
+            line_surf = d._font.render(line, True, PRIMARY_COLOR)
+            canvas.blit(line_surf, (x, y))
 
             row += 1
 
@@ -1378,10 +1461,18 @@ class HealthApp:
             row += row_height
 
     def draw_power_dialog(self, canvas):
-        lines = ["ARE YOU SURE YOU WANT TO", "SHUT DOWN THE WHOLE FLEET?"]
-        line_surfs = [self.osd_font.render(line, True, PRIMARY_COLOR) for line in lines]
+        # Uses self.display._font (2026-08-31) -- the same body font every
+        # other page renders with -- instead of its own separately-sized
+        # osd_font/option_font (32pt/28pt), so the dialog's text reads at
+        # the same point size as the rest of the app instead of standing
+        # out as oversized. Shrinks the box automatically since its size
+        # is computed from the rendered text below; still centered on
+        # FRAME_W/FRAME_H at the bottom of this method regardless of size.
+        d = self.display
+        lines = ["ARE YOU SURE YOU WANT TO", "SHUT DOWN MCBRAIN?"]
+        line_surfs = [d._font.render(line, True, PRIMARY_COLOR) for line in lines]
         option_surfs = [
-            self.option_font.render(opt, True, BLACK if i == self.power_dialog_selection else PRIMARY_COLOR)
+            d._font.render(opt, True, BLACK if i == self.power_dialog_selection else PRIMARY_COLOR)
             for i, opt in enumerate(POWER_OPTIONS)
         ]
 
@@ -1680,17 +1771,19 @@ class HealthApp:
 
     def _handle_gauge_page_keycode(self, code):
         """The dispatcher's catch-all -- reached for pages 0/1 (CPU/MEM,
-        WIFI/NET) and also TEMPERATURE_PAGE_INDEX (2026-08-23), which
-        needs the exact same "nothing but Back" handling and so was
-        never given its own keycode handler. Left/Right is handled
-        globally now (see _cycle_page), before this is ever reached.
-        Up/Down no longer switches which machine is shown here
-        (2026-08-16, removed) -- that was the exact "confusing fast"
-        behavior Select Target replaced; monitor_target is now only ever
-        changed via TARGET/hamburger or the Select Target page (also
-        handled globally/via current_page, before this is ever reached)
-        -- moot anyway on TEMPERATURE_PAGE_INDEX, which was never scoped
-        to monitor_target to begin with. OK/Enter no longer does
+        WIFI/NET) and also TEMPERATURE_PAGE_INDEX (2026-08-23) and
+        PROCESSES_PAGE_INDEX (2026-08-31), which need the exact same
+        "nothing but Back" handling and so were never given their own
+        keycode handler. Left/Right is handled globally now (see
+        _cycle_page), before this is ever reached. Up/Down no longer
+        switches which machine is shown here (2026-08-16, removed) --
+        that was the exact "confusing fast" behavior Select Target
+        replaced; monitor_target is now only ever changed via
+        TARGET/hamburger or the Select Target page (also handled
+        globally/via current_page, before this is ever reached) --
+        moot anyway on TEMPERATURE_PAGE_INDEX/PROCESSES_PAGE_INDEX,
+        which were never scoped to monitor_target to begin with.
+        OK/Enter no longer does
         anything on a gauge page either (2026-08-16, removed) -- control
         mode is entered by picking an app on the menu page now (see
         _activate_menu_selection/assign_to_puppet), not by a separate
@@ -2016,17 +2109,13 @@ class HealthApp:
         row0_y = d.char_px(0, 0)[1]
         canvas.blit(headline_surf, ((FRAME_W - headline_surf.get_width()) // 2, row0_y))
 
-        title = f"CENTRAL SCRUTINIZER {VERSION}".upper()
+        title = "APPEARANCE"
         box_row = 2
         box_rows = d._height - box_row
         self.display.draw_panel_frame(canvas, Panel(
             0, box_row, d._width, box_rows, title, subtitle="BY METAL SHOP"))
 
         row = box_row + 2
-        label_x, px_y = d.char_px(1, row)
-        label_surf = d._font.render(" COLOR:", True, PRIMARY_COLOR)
-        canvas.blit(label_surf, (label_x, px_y))
-        row += 1
 
         for idx, (name, _primary, _warn) in enumerate(COLOR_SCHEMES):
             selected = idx == self.settings_selected
