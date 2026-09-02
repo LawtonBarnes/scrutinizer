@@ -142,9 +142,9 @@ IDLE_TIMEOUT_SECONDS = 120  # menu screen: screensaver, hand off to health after
 # fixed listen port on every puppet.
 PUPPETS = [
     ("P1", "192.168.68.72"),
-    ("P2", "192.168.68.65"),
+    ("P2", "192.168.68.69"),
     ("P3", "192.168.68.68"),
-    ("P4", "192.168.68.64"),
+    ("P4", "192.168.68.67"),
     # production joined the fleet as a real STRINGS-supervised target
     # 2026-08-16 -- SCRUTE no longer auto-launches there (manual
     # fallback only), so this is genuinely just another puppet from

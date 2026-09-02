@@ -80,9 +80,9 @@ done
 # resolve for the `ssh` command itself, not arbitrary HTTP requests.
 declare -A PUPPET_IPS=(
     [p1]=192.168.68.72
-    [p2]=192.168.68.65
+    [p2]=192.168.68.69
     [p3]=192.168.68.68
-    [p4]=192.168.68.64
+    [p4]=192.168.68.67
 )
 
 for p in p1 p2 p3 p4; do
