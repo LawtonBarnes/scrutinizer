@@ -13,7 +13,9 @@ pygame, direct `/dev/fb0` writes, raw `evdev` keyboard input.
 
 ![Running on a real CRT](./img/TV_SCRUTE.jpg)
 
-![Framebuffer capture](./img/SCREEN_SCRUTE.png)
+![Framebuffer capture -- monitoring a remote puppet](./img/SCREEN_SCRUTE.png)
+
+![Framebuffer capture -- remote app assignment menu](./img/SCREEN_SCRUTE_MENU.png)
 
 **Runs on exactly one machine in a fleet** -- the one with a USB remote
 attached. Every other fleet machine ("puppet") runs
