@@ -1895,7 +1895,18 @@ class HealthApp:
         -- an unreachable/offline puppet shouldn't block the rest of the
         fleet or delay MP's own shutdown, which is the one that actually
         matters most to the person standing in front of the remote."""
-        for _name, ip in PUPPETS:
+        for name, ip in PUPPETS:
+            # PRODUCTION exempted from the shutdown broadcast specifically,
+            # 2026-09-12 -- it's now running a second SDR 24/7 (see
+            # project_joan_jett) to log overnight flights while the rest
+            # of McBrain is powered off, so it needs to keep running
+            # through the nightly shutdown. Still fully reachable for
+            # every other broadcast action (restart) and every other
+            # STRINGS endpoint (/assign, /status, /input) -- this is the
+            # one narrow exception, not a removal from PUPPETS. User is
+            # powering it off manually for now.
+            if name == "PRODUCTION" and action == "shutdown":
+                continue
             try:
                 req = urllib.request.Request(
                     f"http://{ip}:{PUPPET_PORT}/power",
