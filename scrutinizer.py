@@ -1692,10 +1692,13 @@ class HealthApp:
             # this was special-cased inside _handle_control_mode_keycode
             # to jump to the target's app menu instead of page 0 --
             # which meant Home didn't actually mean "home" in the one
-            # place a reliable panic button matters most. That job moved
-            # to BACK instead (see _handle_control_mode_keycode), which
-            # fits its "one step up" meaning better than Home's "always
-            # home" one anyway. Flash the control screen's own APPS box
+            # place a reliable panic button matters most. BACK used to
+            # carry that "jump to the app menu" job instead (bebop-only
+            # relay, everything else fell back to it), but that got
+            # generalized away 2026-09-16 -- BACK is now always relayed
+            # to the target app for every app, so Home (here) and
+            # TARGET/hamburger are the only ways to actually leave this
+            # screen. Flash the control screen's own APPS box
             # first if we're leaving it, mirroring TARGET's flash above.
             if self.current_page == CONTROL_PAGE_INDEX:
                 self._flash_button(CONTROL_BUTTON_IDS.get(code))
@@ -1810,39 +1813,29 @@ class HealthApp:
         monitor_target's running app (see _send_relay_key). Home is
         handled globally now (see handle_keycode) -- always page 0,
         unconditionally, same as every other page -- so it never
-        reaches here (2026-08-23 redesign: it used to be special-cased
-        here to jump to the target's app menu instead, which meant Home
-        didn't actually mean "home" while controlling a puppet, the one
-        place a reliable panic button matters most). BACK now carries
-        the "jump to the app menu" job Home used to have -- a one-
-        level-up motion (back to where you picked this app), not a jump
-        all the way to page 0 -- unless the target is currently running
-        bebop, in which case it's relayed instead, since bebop uses
-        Back for in-app menu navigation rather than "exit." Checked
-        against RemotePoller's last-known app for monitor_target
-        (self.remote_poller.get), same source _build_control_mode_screen
-        already reads for the "RUNNING: <app>" footer -- a stale/missing
-        read (offline puppet, no poll yet) just falls back to the
-        ordinary one-level-up behavior, matching every other app. Q/Esc/
-        TARGET/Left/Right/Power are already handled globally in
-        handle_keycode before this is ever reached -- Left/Right leaving
-        this page is exactly what ends the relay (see _cycle_page), no
-        separate "stop controlling" gesture needed; Power (fleet-wide as
-        of 2026-08-27) never reaches here at all anymore, unlike its
-        pre-2026-08-27 single-target-relay design. Every branch flashes
-        its own button box first (see _flash_button) -- for the one
-        that exits this screen, that means one frame of the live-control screen
-        with the box inverted, then the transition, same as TARGET's
-        own flash in handle_keycode."""
+        reaches here, and is the standard way to exit control mode
+        (along with TARGET/hamburger, also global). BACK is now always
+        relayed to the target app (2026-09-16 generalization -- used to
+        be bebop-only, with every other app getting a local "jump to
+        the app menu" fallback instead; TV DINNER surfaced the same
+        need bebop did -- BACK means "go up a level within the app"
+        (e.g. TV DINNER's stop-playback-return-to-guide), not "leave
+        control mode entirely" -- and there was never a good reason for
+        that to be one app's special case instead of the rule.
+        Consistent with Home/TARGET already being the real "get me out
+        of here" buttons, unconditionally, from any page including this
+        one. Q/Esc/TARGET/Left/Right/Power are already handled globally
+        in handle_keycode before this is ever reached -- Left/Right
+        leaving this page is exactly what ends the relay (see
+        _cycle_page), no separate "stop controlling" gesture needed;
+        Power (fleet-wide as of 2026-08-27) never reaches here at all
+        anymore, unlike its pre-2026-08-27 single-target-relay design.
+        Every branch flashes its own button box first (see
+        _flash_button)."""
         button_id = CONTROL_BUTTON_IDS.get(code)
         if code == ecodes.KEY_BACK:
-            stats, _fresh = self.remote_poller.get(self.monitor_target)
-            if (stats or {}).get("app") == "bebop":
-                self._send_relay_key(code, key_name="KEY_BACK")
-                self._flash_button(button_id)
-            else:
-                self._flash_button(button_id)
-                self.current_page = MENU_PAGE_INDEX
+            self._send_relay_key(code, key_name="KEY_BACK")
+            self._flash_button(button_id)
         elif code in CONTROL_RELAY_KEYS:
             self._send_relay_key(code)
             self._flash_button(button_id)
