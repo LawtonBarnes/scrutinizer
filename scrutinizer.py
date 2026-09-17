@@ -639,6 +639,15 @@ def check_internet():
         return False
 
 
+def check_tvdinner_media():
+    # Same check STRINGS's own check_tvdinner_media duplicates -- the
+    # media drive lives on MP, shared to every other host over CIFS.
+    try:
+        return os.path.ismount("/mnt/tvdinner") and len(os.listdir("/mnt/tvdinner")) > 0
+    except OSError:
+        return False
+
+
 def check_mpd():
     # bebop is an MPD client only -- its actual hardware dependency is
     # "is MPD up and listening," same check STRINGS's own check_mpd
@@ -665,6 +674,7 @@ APPS = [
     # Same reason as BEBOP above -- points at config.py, not main.py, for
     # its VERSION scan (main.py does `VERSION = config.VERSION`).
     ("6", "JOAN JET", "ADS-B radar", "joanjett", "/opt/joanjett/config.py", check_sdr_dongle),
+    ("7", "TV DINNER", "EPG-style MP4 player", "tvdinner", "/opt/tvdinner/app.py", check_tvdinner_media),
 ]
 
 HW_STATUS_LABELS = {
