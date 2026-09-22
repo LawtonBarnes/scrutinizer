@@ -59,14 +59,18 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
 import pygame  # noqa: E402  (must come after SDL env vars are set)
 
-VERSION = "3.1"
+VERSION = "3.2"
 
 BASE_DIR = Path(__file__).resolve().parent
 FONT_PATH = BASE_DIR / "VCR_OSD_MONO_1.001.ttf"
 BORDER_FONT_PATH = BASE_DIR / "Px437_IBM_VGA_9x16.ttf"  # box-drawing glyphs only, VCR OSD MONO lacks them
 SETTINGS_PATH = BASE_DIR / "settings.json"  # gitignored, same pattern as STRINGS's state.json -- local preference, not source
-SPLASH_PATH = BASE_DIR / "splash.png"  # optional -- see show_splash()
-SPLASH_SECONDS = 5.0
+# SPLASH_PAGE_INDEX art (2026-09-22) -- one per look, picked by the active
+# COLOR_SCHEMES entry (NOIR gets the B&W one, AMBER/GREEN share the color
+# one). Pre-sized to 720x480 by the user, already corrected for the CRT's
+# non-square pixels, so they're blitted at FRAME_W x FRAME_H as-is.
+SPLASH_NOIR_PATH = BASE_DIR / "splash-noir.png"
+SPLASH_COLOR_PATH = BASE_DIR / "splash-color.png"
 
 FRAME_W, FRAME_H = 720, 480
 UNDERSCAN = 0.10
@@ -83,6 +87,14 @@ BLACK = (0, 0, 0)
 STATUS_GREEN = (0x00, 0xFF, 0x00)
 STATUS_RED = (220, 30, 30)
 STATUS_WHITE = (0xFF, 0xFF, 0xFF)
+
+# MCBRAIN STATUS thermometer bars (2026-09-22): empty at 30C/86F (room
+# temp), full at 85C/185F (hard-throttle territory). Bar fill uses the
+# row's status color. The two longest get_throttled_status() strings are
+# shortened on that page only, so the status column fits beside the bar.
+TEMP_BAR_MIN_C = 30.0
+TEMP_BAR_MAX_C = 85.0
+TEMP_STATUS_ABBREV = {"UNDERVOLTAGE": "UNDERVOLT", "FREQ CAPPED": "FREQ CAP"}
 
 # Three selectable color schemes (name, primary, warning) -- the Settings
 # page's APPEARANCE list cycles through these via apply_color_scheme(). RED
@@ -134,7 +146,20 @@ KD_GRAPHICS = 0x01
 STATS_REFRESH_SECONDS = 1.0  # health screen: how often to re-poll CPU/WiFi stats
 HARDWARE_REFRESH_SECONDS = 30  # how often to re-poll sibling-app hardware/connectivity checks
 IDLE_POLL_TIMEOUT = 1.0
-IDLE_TIMEOUT_SECONDS = 120  # menu screen: screensaver, hand off to health after 2 idle minutes
+# Screensaver (2026-09-22, replaces the old "2 idle minutes on the menu
+# page bounces to page 0" rule): after SCREENSAVER_IDLE_SECONDS with no
+# input on any page, cycle SCREENSAVER_PAGES (defined below the page
+# indices) for SCREENSAVER_DWELL_SECONDS each. Also the launch state --
+# SCRUTE starts parked on the splash in screensaver mode.
+SCREENSAVER_IDLE_SECONDS = 180
+SCREENSAVER_DWELL_SECONDS = 120
+# After a page jump triggered by an OK-capable press (screensaver wake,
+# Select Target's OK), swallow further confirm keys this long -- the
+# remote's OK fires KEY_ENTER *and* BTN_LEFT on separate HID interfaces
+# (see MENU_ACTIVATION_DEBOUNCE_SECONDS), so without this the duplicate
+# would land on the new page and act there (e.g. pick a target, or
+# launch an app).
+CONFIRM_SWALLOW_SECONDS = 0.5
 
 # McBrain remote monitoring -- Up/Down on the health screen cycles which
 # of these (or LOCAL) is displayed. IPs match the p1-p4 SSH aliases in
@@ -253,7 +278,14 @@ MENU_PAGE_INDEX = 4
 SETTINGS_PAGE_INDEX = 5
 TARGET_SELECT_PAGE_INDEX = 6
 CONTROL_PAGE_INDEX = 7
-PAGE_COUNT = 8
+# Splash (2026-09-22) -- a normal page now instead of a timed launch-only
+# screen. Last index so it sits just before CPU in the circular
+# Left/Right rotation without renumbering everything else (page 0 is
+# still CPU, which Back relies on).
+SPLASH_PAGE_INDEX = 8
+PAGE_COUNT = 9
+SCREENSAVER_PAGES = [SPLASH_PAGE_INDEX, 0, 1, TEMPERATURE_PAGE_INDEX, PROCESSES_PAGE_INDEX]
+CONFIRM_KEYS = (ecodes.KEY_ENTER, ecodes.KEY_KPENTER, ecodes.BTN_LEFT, ecodes.BTN_MOUSE)
 PUPPET_POLL_TIMEOUT_SECONDS = 2
 PUPPET_POLL_INTERVAL_SECONDS = 3
 
@@ -353,32 +385,21 @@ class FrameBuffer:
         os.close(self.fd)
 
 
-def show_splash(fb):
-    """Blocking splash shown once at SCRUTE's own launch (its process
-    startup, not the machine's Plymouth boot splash -- see
-    project_bars/the McBrain devil-logo work for that separate, OS-level
-    splash) -- same technique/rationale as bars.py's version of this
-    function, duplicated per this codebase's no-shared-library
-    convention. Called once from HealthApp.__init__, NOT from
-    acquire_console() -- that method is also re-run every time control
-    returns from a launched app, and the splash should only ever play on
-    SCRUTE's own initial startup, not on every trip back from BARS/
-    LOUDNESS/etc."""
-    if not SPLASH_PATH.exists():
-        return
+def load_splash(path):
+    """Loads one SPLASH_PAGE_INDEX image, scaled to exactly FRAME_W x
+    FRAME_H (a no-op for the shipped 720x480 art) -- loaded once at
+    startup and cached, not per-render. Returns None if missing/broken,
+    in which case the splash page just draws the text fallback."""
+    if not path.exists():
+        return None
     try:
-        img = pygame.image.load(str(SPLASH_PATH)).convert()
+        img = pygame.image.load(str(path)).convert()
     except (pygame.error, OSError) as exc:
         print(f"Splash load failed: {exc}", file=sys.stderr)
-        return
-    canvas = pygame.Surface((FRAME_W, FRAME_H))
-    canvas.fill(BLACK)
-    img_w, img_h = img.get_size()
-    scale = min(FRAME_W / img_w, FRAME_H / img_h)
-    scaled = pygame.transform.smoothscale(img, (int(img_w * scale), int(img_h * scale)))
-    canvas.blit(scaled, ((FRAME_W - scaled.get_width()) // 2, (FRAME_H - scaled.get_height()) // 2))
-    fb.write_surface(canvas)
-    time.sleep(SPLASH_SECONDS)
+        return None
+    if img.get_size() != (FRAME_W, FRAME_H):
+        img = pygame.transform.smoothscale(img, (FRAME_W, FRAME_H))
+    return img
 
 
 ########  Stat-gathering  ######################################################
@@ -1100,6 +1121,17 @@ class HealthApp:
         self.target_selected = 0  # cursor position on the Select Target page
         self.last_pressed_button = None  # button-box id currently flashed on the live-control screen, or None
 
+        # Screensaver state (2026-09-22) -- starts active, parked on the
+        # splash, so launch looks like "screensaver on its first page."
+        # See SCREENSAVER_IDLE_SECONDS and _wake_from_screensaver.
+        self.splash_noir = load_splash(SPLASH_NOIR_PATH)
+        self.splash_color = load_splash(SPLASH_COLOR_PATH)
+        self.screensaver_active = True
+        self.screensaver_index = 0
+        self.screensaver_last_advance = time.time()
+        self.current_page = SCREENSAVER_PAGES[0]
+        self._swallow_confirm_until = 0.0
+
         self.kbd_devices = find_keyboard_devices()
         self.selector = selectors.DefaultSelector()
         for dev in self.kbd_devices:
@@ -1108,7 +1140,6 @@ class HealthApp:
         self.tty_fd = None
         self.console_graphics_mode = False
         self.acquire_console()
-        show_splash(self.fb)
 
     def _handle_signal(self, signum, frame):
         self._quit_requested = True
@@ -1176,7 +1207,9 @@ class HealthApp:
 
     def render(self):
         canvas = pygame.Surface((FRAME_W, FRAME_H))
-        if self.current_page == CONTROL_PAGE_INDEX:
+        if self.current_page == SPLASH_PAGE_INDEX:
+            self._build_splash_page(canvas)
+        elif self.current_page == CONTROL_PAGE_INDEX:
             self._build_control_mode_screen(canvas)
         elif self.current_page == TARGET_SELECT_PAGE_INDEX:
             self._build_target_select_screen(canvas)
@@ -1191,6 +1224,19 @@ class HealthApp:
         if self.power_dialog_active:
             self.draw_power_dialog(canvas)
         self.fb.write_surface(canvas)
+
+    def _build_splash_page(self, canvas):
+        """SPLASH_PAGE_INDEX (2026-09-22) -- full-screen art, no headline,
+        picked by the active look (see SPLASH_NOIR_PATH). Falls back to
+        a plain centered title if the image is missing."""
+        is_noir = COLOR_SCHEMES[self.color_scheme_index][0] == "NOIR"
+        img = self.splash_noir if is_noir else self.splash_color
+        if img is not None:
+            canvas.blit(img, (0, 0))
+            return
+        canvas.fill(BLACK)
+        surf = self.display._label_font.render(f"CENTRAL SCRUTINIZER {VERSION}", True, PRIMARY_COLOR)
+        canvas.blit(surf, ((FRAME_W - surf.get_width()) // 2, (FRAME_H - surf.get_height()) // 2))
 
     def _page_headline(self, target_label):
         """'CONTROLLING: <name>' (2026-08-16, originally just for remote
@@ -1270,6 +1316,16 @@ class HealthApp:
 
         is_noir = COLOR_SCHEMES[self.color_scheme_index][0] == "NOIR"
 
+        # Row layout (2026-09-22, thermometer bars added): hostname at col
+        # 2, bar, "185.0 F" right-aligned, then a status column wide
+        # enough for the longest (abbreviated) status plus a margin before
+        # the right border. Positions derive from d._width so the status
+        # column always keeps its room and the bar absorbs any squeeze.
+        STATUS_COLS = 10  # "TEMP LIMIT" -- see TEMP_STATUS_ABBREV
+        status_col = d._width - 2 - STATUS_COLS
+        temp_col = status_col - 8  # 7-char "185.0 F" + 1 space
+        bar_col = 10  # draw_bar insets its own left edge by one char, so the bar starts at col 11
+
         row = box_row + 2
         for fallback_label, target in STACK_ORDER:
             if target == "LOCAL":
@@ -1283,12 +1339,14 @@ class HealthApp:
             label_surf = d._font.render(hostname[:8], True, PRIMARY_COLOR)
             canvas.blit(label_surf, (x, y))
 
+            temp = None
             if not fresh or stats is None:
                 temp_text, status_text = "--", "OFFLINE"
             else:
                 temp = stats.get("cpu_temp")
                 temp_text = f"{temp * 9 / 5 + 32:.1f} F" if temp is not None else "N/A"
                 status_text = stats.get("throttled", "UNKNOWN")
+            status_text = TEMP_STATUS_ABBREV.get(status_text, status_text)
 
             if is_noir:
                 status_color = STATUS_WHITE
@@ -1297,11 +1355,18 @@ class HealthApp:
             else:
                 status_color = STATUS_RED
 
-            temp_x, _ = d.char_px(11, row)
-            temp_surf = d._font.render(f"{temp_text:>8}", True, PRIMARY_COLOR)
+            # Empty outline when there's no reading (offline/N/A), so the
+            # row still lines up with the others.
+            bar_x, _ = d.char_px(bar_col, row)
+            bar_rect = pygame.Rect(bar_x, y, (temp_col - 1 - bar_col) * d._char_w, d._char_h - 4)
+            fraction = 0.0 if temp is None else (temp - TEMP_BAR_MIN_C) / (TEMP_BAR_MAX_C - TEMP_BAR_MIN_C)
+            d.draw_bar(canvas, bar_rect, fraction, color=status_color)
+
+            temp_x, _ = d.char_px(temp_col, row)
+            temp_surf = d._font.render(f"{temp_text:>7}", True, PRIMARY_COLOR)
             canvas.blit(temp_surf, (temp_x, y))
 
-            status_x, _ = d.char_px(20, row)
+            status_x, _ = d.char_px(status_col, row)
             status_surf = d._font.render(status_text, True, status_color)
             canvas.blit(status_surf, (status_x, y))
 
@@ -1665,8 +1730,26 @@ class HealthApp:
 
     def handle_keycode(self, code):
         """Returns True if the app should redraw after this key."""
+        if code in CONFIRM_KEYS and time.time() < self._swallow_confirm_until:
+            return False  # OK's second HID event after a page jump -- see CONFIRM_SWALLOW_SECONDS
         if self.power_dialog_active:
             return self.handle_power_dialog_keycode(code)
+        if self.screensaver_active:
+            self.screensaver_active = False
+            # HOME/TARGET/Power/Q/Esc fall through to their normal global
+            # handling below (HOME -> ASSIGN TO, TARGET -> Select Target,
+            # Power -> dialog); anything else just wakes to REMOTE HELP,
+            # or Select Target when MP itself is the target (no REMOTE
+            # HELP page exists for LOCAL). The waking press is never
+            # relayed or acted on beyond the jump.
+            if code not in (ecodes.KEY_COMPOSE, ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME,
+                            ecodes.KEY_POWER, ecodes.KEY_Q, ecodes.KEY_ESC):
+                if self.monitor_target == "LOCAL":
+                    self._land_on(TARGET_SELECT_PAGE_INDEX)
+                else:
+                    self._land_on(CONTROL_PAGE_INDEX)
+                self._swallow_confirm_until = time.time() + CONFIRM_SWALLOW_SECONDS
+                return True
         if code == ecodes.KEY_COMPOSE:
             # TARGET/hamburger is global (2026-08-16) -- always jumps
             # straight to the Select Target page from any state,
@@ -1685,8 +1768,11 @@ class HealthApp:
             self.target_selected = MONITOR_TARGETS.index(self.monitor_target)
             return True
         if code in (ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME):
-            # Home is unconditional (2026-08-23 redesign) -- always page
-            # 0, from any state, no exceptions, checked globally here
+            # Home = APPS (2026-09-22) -- always jumps to the app menu
+            # (ASSIGN TO for a puppet), matching the remote's own APPS
+            # label, instead of page 0. Still unconditional from every
+            # page. History from the 2026-08-23 version (then "always page
+            # 0") kept below for context -- checked globally here
             # same as TARGET/hamburger above instead of being handled
             # (and special-cased) in each sub-handler below. Previously
             # this was special-cased inside _handle_control_mode_keycode
@@ -1702,7 +1788,7 @@ class HealthApp:
             # first if we're leaving it, mirroring TARGET's flash above.
             if self.current_page == CONTROL_PAGE_INDEX:
                 self._flash_button(CONTROL_BUTTON_IDS.get(code))
-            self.current_page = 0
+            self.current_page = MENU_PAGE_INDEX
             return True
         if code == ecodes.KEY_POWER:
             # Power is unconditional and fleet-wide (2026-08-27 redesign)
@@ -1769,6 +1855,12 @@ class HealthApp:
             if page == CONTROL_PAGE_INDEX and self.monitor_target == "LOCAL":
                 continue
             break
+        self._land_on(page)
+
+    def _land_on(self, page):
+        """Switches to `page`, applying the fresh-landing resets described
+        in _cycle_page -- factored out 2026-09-22 so the screensaver wake
+        and Select Target's OK get the same resets as Left/Right."""
         if page == CONTROL_PAGE_INDEX and self.current_page != CONTROL_PAGE_INDEX:
             self.control_mode_last_result = None
         elif page == TARGET_SELECT_PAGE_INDEX and self.current_page != TARGET_SELECT_PAGE_INDEX:
@@ -1811,8 +1903,8 @@ class HealthApp:
     def _handle_control_mode_keycode(self, code):
         """Active on CONTROL_PAGE_INDEX -- D-pad/OK/Vol relay live to
         monitor_target's running app (see _send_relay_key). Home is
-        handled globally now (see handle_keycode) -- always page 0,
-        unconditionally, same as every other page -- so it never
+        handled globally now (see handle_keycode) -- always the app
+        menu, unconditionally, same as every other page -- so it never
         reaches here, and is the standard way to exit control mode
         (along with TARGET/hamburger, also global). BACK is now always
         relayed to the target app (2026-09-16 generalization -- used to
@@ -1927,8 +2019,9 @@ class HealthApp:
         directly via the global TARGET/hamburger binding (see
         handle_keycode) from any state. Up/Down moves the cursor over
         MONITOR_TARGETS, OK picks it (sets monitor_target and jumps
-        straight to that machine's app menu, mirroring
-        _activate_menu_selection's own landing choice). Back goes to
+        straight to REMOTE HELP for a puppet, mirroring
+        _activate_menu_selection's own landing choice, or the app menu
+        for LOCAL). Back goes to
         page 0 (Home is handled globally now, see handle_keycode, so
         it never reaches here) -- used to be a pure cancel back to
         whatever page you'd come from, but that "remember the previous
@@ -1941,9 +2034,12 @@ class HealthApp:
             self.target_selected = (self.target_selected - 1) % len(MONITOR_TARGETS)
         elif code == ecodes.KEY_DOWN:
             self.target_selected = (self.target_selected + 1) % len(MONITOR_TARGETS)
-        elif code in (ecodes.KEY_ENTER, ecodes.KEY_KPENTER, ecodes.BTN_LEFT, ecodes.BTN_MOUSE):
+        elif code in CONFIRM_KEYS:
+            # Lands on REMOTE HELP for a puppet (2026-09-22 -- was the app
+            # menu), or the app menu for LOCAL, which has no REMOTE HELP.
             self.monitor_target = MONITOR_TARGETS[self.target_selected]
-            self.current_page = MENU_PAGE_INDEX
+            self._land_on(MENU_PAGE_INDEX if self.monitor_target == "LOCAL" else CONTROL_PAGE_INDEX)
+            self._swallow_confirm_until = time.time() + CONFIRM_SWALLOW_SECONDS
         else:
             return False
         return True
@@ -2014,7 +2110,7 @@ class HealthApp:
                          color=BLACK if pressed else PRIMARY_COLOR)
 
         draw_box(0, 1, 10, 3, "APPS", "apps")
-        draw_box(30, 1, 10, 3, "NOFX")  # no keycode identified yet -- never flashes, see CONTROL_BUTTON_IDS
+        draw_box(30, 1, 10, 3, "")  # remote's air-mouse toggle -- no function, deliberately blank (label removed 2026-09-22)
 
         draw_box(14, 3, 12, 3, CONTROL_DPAD_LABELS["up"], "up")
 
@@ -2244,6 +2340,8 @@ class HealthApp:
                             result = self.handle_keycode(event.code)
                         elif event.type == ecodes.EV_REL:
                             result = self.handle_rel_event(event.code, event.value)
+                            if not result:
+                                continue  # sub-threshold air-mouse drift shouldn't hold off the screensaver
                         else:
                             continue
                         last_input_time = time.time()
@@ -2259,18 +2357,32 @@ class HealthApp:
                     break
 
                 now = time.time()
-                if self.current_page != MENU_PAGE_INDEX and now - last_stats_refresh >= STATS_REFRESH_SECONDS:
+                # Screensaver (2026-09-22): start after SCREENSAVER_IDLE_
+                # SECONDS of no input on any page (never over the power
+                # dialog), then advance through SCREENSAVER_PAGES every
+                # SCREENSAVER_DWELL_SECONDS until a press wakes it (see
+                # handle_keycode).
+                if self.screensaver_active:
+                    if now - self.screensaver_last_advance >= SCREENSAVER_DWELL_SECONDS:
+                        self.screensaver_index = (self.screensaver_index + 1) % len(SCREENSAVER_PAGES)
+                        self.current_page = SCREENSAVER_PAGES[self.screensaver_index]
+                        self.screensaver_last_advance = now
+                        self.poller.refresh()
+                        last_stats_refresh = now
+                        self.render()
+                elif not self.power_dialog_active and now - last_input_time >= SCREENSAVER_IDLE_SECONDS:
+                    self.screensaver_active = True
+                    self.screensaver_index = 0
+                    self.screensaver_last_advance = now
+                    self.current_page = SCREENSAVER_PAGES[0]
+                    self.render()
+
+                # The splash is static and the menu has its own refresh
+                # below -- everything else re-polls and redraws each tick.
+                if (self.current_page not in (MENU_PAGE_INDEX, SPLASH_PAGE_INDEX)
+                        and now - last_stats_refresh >= STATS_REFRESH_SECONDS):
                     self.poller.refresh()
                     last_stats_refresh = now
-                    self.render()
-                # Screensaver: 2 minutes idle while sitting on the menu
-                # page (not a gauge page, not mid-dialog) bounces back to
-                # page 0 exactly like a Back/Home press would.
-                elif (self.current_page == MENU_PAGE_INDEX and not self.power_dialog_active
-                        and now - last_input_time >= IDLE_TIMEOUT_SECONDS):
-                    self.current_page = 0
-                    self.poller.refresh()
-                    last_input_time = now
                     self.render()
 
                 # Independent of the page-specific branch above -- a
