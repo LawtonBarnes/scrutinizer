@@ -2126,7 +2126,7 @@ class HealthApp:
         draw_box(14, 7, 12, 3, CONTROL_DPAD_LABELS["down"], "down")
 
         draw_box(0, 9, 10, 3, "TARGET", "target")
-        draw_box(30, 9, 10, 3, "BACK", "back")
+        draw_box(30, 9, 10, 3, "ABOUT", "back")  # BACK button -- toggles each app's ABOUT screen (2026-09-22)
 
         draw_box(0, 12, 10, 3, "MUTE", "mute")
         draw_box(30, 12, 10, 3, "VOL+", "volup")
