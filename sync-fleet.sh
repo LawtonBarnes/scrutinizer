@@ -30,7 +30,7 @@
 # Usage: ./sync-fleet.sh
 set -uo pipefail
 
-APP_NAMES="bars loudness bebop channel38 tvdinner joanjett weatherstar sky"
+APP_NAMES="bars loudness bebop channel38 tvdinner joanjett weatherstar spacetruckin"
 
 # curl needs a real IP -- SSH aliases only resolve for `ssh` itself. P2/P4
 # have no DHCP reservation and can drift after a power event (see

@@ -696,7 +696,7 @@ APPS = [
     # its VERSION scan (main.py does `VERSION = config.VERSION`).
     ("6", "JOAN JET", "ADS-B radar", "joanjett", "/opt/joanjett/config.py", check_sdr_dongle),
     ("7", "TV DINNER", "EPG-style MP4 player", "tvdinner", "/opt/tvdinner/app.py", check_tvdinner_media),
-    ("8", "SKY", "GOES satellite loop", "sky", "/opt/sky/sky.py", check_internet),
+    ("8", "SPACE TRUCKIN", "GOES satellite loop", "spacetruckin", "/opt/spacetruckin/spacetruckin.py", check_internet),
 ]
 
 HW_STATUS_LABELS = {
