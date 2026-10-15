@@ -696,6 +696,7 @@ APPS = [
     # its VERSION scan (main.py does `VERSION = config.VERSION`).
     ("6", "JOAN JET", "ADS-B radar", "joanjett", "/opt/joanjett/config.py", check_sdr_dongle),
     ("7", "TV DINNER", "EPG-style MP4 player", "tvdinner", "/opt/tvdinner/app.py", check_tvdinner_media),
+    ("8", "SKY", "GOES satellite loop", "sky", "/opt/sky/sky.py", check_internet),
 ]
 
 HW_STATUS_LABELS = {
@@ -1485,9 +1486,22 @@ class HealthApp:
             0, box_row, d._width, box_rows, title, subtitle="BY METAL SHOP"))
 
         start_row = box_row + 2
+        end_row = box_row + box_rows - 1  # the box's bottom border row
+
+        # One row per app, two when it has a readiness warning (see
+        # row_height below). Scrolls once that outgrows the box
+        # (2026-10-14, SKY made 8 apps -- MP's own LOCAL menu, with 4+
+        # NOT INSTALLED HERE rows, no longer fit): the first app shown is
+        # the earliest one that still keeps the selection on screen.
+        heights = [1 if hardware_status.get(app[3], "ready") == "ready" else 2 for app in APPS]
+        first = 0
+        while first < self.selected and sum(heights[first:self.selected + 1]) > end_row - start_row:
+            first += 1
 
         row = start_row
-        for idx in range(len(APPS)):
+        for idx in range(first, len(APPS)):
+            if row + heights[idx] > end_row:
+                break
             selected = idx == self.selected
             text_color = BLACK if selected else PRIMARY_COLOR
 
