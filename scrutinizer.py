@@ -78,13 +78,12 @@ TARGET_WIDTH = 40
 
 BLACK = (0, 0, 0)
 
-# Fixed status colors for the MCBRAIN STATUS page's per-machine status
-# column -- deliberately NOT PRIMARY_COLOR/WARNING_COLOR (those follow
-# the active COLOR_SCHEMES entry and would make OK/error unreadable
-# against each other under AMBER ALERT or GREEN MANALISHI). NOIR is the
+# Status colors for the MCBRAIN STATUS page's per-machine status column.
+# OK follows PRIMARY_COLOR (orange under AMBER ALERT, green under GREEN
+# MANALISHI); anything else is always STATUS_RED, deliberately not
+# WARNING_COLOR so an alert stays red regardless of scheme. NOIR is the
 # one exception: its whole point is a monochrome look, so status text
-# goes plain white there instead of green/red.
-STATUS_GREEN = (0x00, 0xFF, 0x00)
+# goes plain white there instead.
 STATUS_RED = (220, 30, 30)
 STATUS_WHITE = (0xFF, 0xFF, 0xFF)
 
@@ -1352,7 +1351,7 @@ class HealthApp:
             if is_noir:
                 status_color = STATUS_WHITE
             elif status_text == "OK":
-                status_color = STATUS_GREEN
+                status_color = PRIMARY_COLOR
             else:
                 status_color = STATUS_RED
 
