@@ -696,6 +696,10 @@ APPS = [
     ("6", "JOAN JET", "ADS-B radar", "joanjett", "/opt/joanjett/config.py", check_sdr_dongle),
     ("7", "TV DINNER", "EPG-style MP4 player", "tvdinner", "/opt/tvdinner/app.py", check_tvdinner_media),
     ("8", "SPACE TRUCKIN", "GOES satellite loop", "spacetruckin", "/opt/spacetruckin/spacetruckin.py", check_internet),
+    # PRODUCTION only (the 2x2 wall's 1024x768 frame); config.py for the
+    # VERSION scan, like JOAN JET. Reads P4's readsb over the LAN, so no
+    # local hardware to check.
+    ("9", "AIR METAL", "Live ADS-B flight sim", "airmetal", "/opt/airmetal/config.py", None),
 ]
 
 HW_STATUS_LABELS = {
