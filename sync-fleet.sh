@@ -32,9 +32,9 @@ set -uo pipefail
 
 APP_NAMES="bars loudness bebop channel38 tvdinner joanjett weatherstar spacetruckin airmetal"
 
-# curl needs a real IP -- SSH aliases only resolve for `ssh` itself. P2/P4
-# have no DHCP reservation and can drift after a power event (see
-# project_puppet_fleet); if one shows as unreachable, re-check its IP.
+# curl needs a real IP -- SSH aliases only resolve for `ssh` itself. Every
+# host has a DHCP reservation in the Deco app; if one shows as unreachable,
+# re-check its IP there.
 declare -A PUPPET_IPS=(
     [p1]=192.168.68.72
     [p2]=192.168.68.69
@@ -43,6 +43,16 @@ declare -A PUPPET_IPS=(
     [production]=192.168.68.71
 )
 PUPPETS="p1 p2 p3 p4 production"
+
+# Bail early rather than fail host by host: without the aliases, ssh -G
+# just echoes the bare name back as the hostname.
+for h in mp $PUPPETS; do
+    if [ "$(ssh -G "$h" 2>/dev/null | awk '/^hostname /{print $2}')" = "$h" ]; then
+        echo "sync-fleet.sh: no SSH alias for \"$h\" on $(hostname) -- run this from the" >&2
+        echo "Windows workstation:  bash <(ssh mp cat /opt/scrutinizer/sync-fleet.sh)" >&2
+        exit 2
+    fi
+done
 
 DRIFT=0
 PY=$(command -v python3 || command -v python)
