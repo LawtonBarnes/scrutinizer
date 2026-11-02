@@ -169,13 +169,13 @@ PUPPETS = [
     ("P2", "192.168.68.69"),
     ("P3", "192.168.68.65"),
     ("P4", "192.168.68.70"),
-    # production joined the fleet as a real STRINGS-supervised target
+    # QUAD (then named production) joined the fleet as a real STRINGS-supervised target
     # 2026-08-16 -- SCRUTE no longer auto-launches there (manual
     # fallback only), so this is genuinely just another puppet from
     # MP's perspective now. No other special-casing needed anywhere --
     # RemotePoller/assign_to_puppet/_send_relay_key are all already
     # fully generic over PUPPETS.
-    ("PRODUCTION", "192.168.68.71"),
+    ("QUAD", "192.168.68.71"),
 ]
 MONITOR_TARGETS = ["LOCAL"] + [name for name, _ip in PUPPETS]
 PUPPET_PORT = 8420
@@ -696,7 +696,7 @@ APPS = [
     ("6", "JOAN JET", "ADS-B radar", "joanjett", "/opt/joanjett/config.py", check_sdr_dongle),
     ("7", "TV DINNER", "EPG-style MP4 player", "tvdinner", "/opt/tvdinner/app.py", check_tvdinner_media),
     ("8", "SPACE TRUCKIN", "GOES satellite loop", "spacetruckin", "/opt/spacetruckin/spacetruckin.py", check_internet),
-    # PRODUCTION only (the 2x2 wall's 1024x768 frame); config.py for the
+    # QUAD only (the 2x2 wall's 1024x768 frame); config.py for the
     # VERSION scan, like JOAN JET. Reads P4's readsb over the LAN, so no
     # local hardware to check.
     ("9", "AIR METAL", "Live ADS-B flight sim", "airmetal", "/opt/airmetal/config.py", None),
@@ -2000,7 +2000,7 @@ class HealthApp:
         from run()'s tail right before MP shuts/restarts itself, since
         MP is the last machine standing once its own
         subprocess.run(["sudo", "shutdown", ...]) call there runs.
-        PUPPETS already covers P1-P4 and PRODUCTION (folded in as a real
+        PUPPETS already covers P1-P4 and QUAD (folded in as a real
         STRINGS target 2026-08-16), so this reaches all 5 other fleet
         machines with no special-casing. Short per-host timeout and
         swallowed errors, same shape as _send_relay_key/assign_to_puppet
@@ -2161,7 +2161,7 @@ class HealthApp:
 
     def _build_target_select_screen(self, canvas):
         """TARGET/hamburger overlay (2026-08-16) -- a flat picker over
-        MONITOR_TARGETS (LOCAL/P1-P4/PRODUCTION), styled like the app
+        MONITOR_TARGETS (LOCAL/P1-P4/QUAD), styled like the app
         menu's box but simpler: one row per machine, no version/hardware
         columns, since machines don't have those the way apps do.
         Selecting a row hands off to _handle_target_select_keycode."""

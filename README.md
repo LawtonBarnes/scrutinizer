@@ -31,7 +31,7 @@ you're on:
 
 | Page | Content | `↑`/`↓` |
 |---|---|---|
-| 1 | CPU temp/clock/load/per-core, memory | Switch monitored machine: `LOCAL` → each puppet → `PRODUCTION` → back to `LOCAL` |
+| 1 | CPU temp/clock/load/per-core, memory | Switch monitored machine: `LOCAL` → each puppet → `QUAD` → back to `LOCAL` |
 | 2 | WiFi signal/SSID, network throughput, disk usage | Same as page 1 |
 | 3 | App menu -- cursor-navigable list of installed apps for whichever machine is currently selected | Move the menu cursor |
 
@@ -40,7 +40,7 @@ you're on:
 | `←` / `→` | Change page |
 | `↑` / `↓` | Context-sensitive -- see table above |
 | Menu / hamburger | Jump straight to the app menu (page 3) for whichever machine is currently selected |
-| `Enter` | On the app menu: launch (if `LOCAL`) or remotely assign (if a puppet/`PRODUCTION`) the highlighted app |
+| `Enter` | On the app menu: launch (if `LOCAL`) or remotely assign (if a puppet/`QUAD`) the highlighted app |
 | `Home` / `Back` | Jump straight to page 1 |
 | `Q` / `Esc` | Quit to shell |
 | `Power` | Confirm dialog: shutdown/restart **the whole fleet at once**, not just this machine |

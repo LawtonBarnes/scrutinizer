@@ -4,7 +4,7 @@
 # that's what left every puppet's git state stale and blocked `git pull`
 # until the 2026-09-22 cleanup (see project_mcbrain).
 #
-# For MP and every STRINGS puppet (P1-P4 + PRODUCTION): `git pull
+# For MP and every STRINGS puppet (P1-P4 + QUAD): `git pull
 # --ff-only` every app repo installed under /opt (plus STRINGS itself on
 # puppets), then restart only what actually needs it:
 #   - puppets: the currently assigned app, via STRINGS's /restart, only if
@@ -24,7 +24,7 @@
 # never count as drift.
 #
 # Must run from a machine with the fleet's SSH aliases (mp, p1-p4,
-# production) -- in practice the Windows workstation; PRODUCTION itself
+# quad) -- in practice the Windows workstation; QUAD itself
 # has no SSH access to the puppets.
 #
 # Usage: ./sync-fleet.sh
@@ -40,9 +40,9 @@ declare -A PUPPET_IPS=(
     [p2]=192.168.68.69
     [p3]=192.168.68.65
     [p4]=192.168.68.70
-    [production]=192.168.68.71
+    [quad]=192.168.68.71
 )
-PUPPETS="p1 p2 p3 p4 production"
+PUPPETS="p1 p2 p3 p4 quad"
 
 # Bail early rather than fail host by host: without the aliases, ssh -G
 # just echoes the bare name back as the hostname.
