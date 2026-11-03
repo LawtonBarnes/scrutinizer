@@ -700,6 +700,7 @@ APPS = [
     # VERSION scan, like JOAN JET. Reads P4's readsb over the LAN, so no
     # local hardware to check.
     ("9", "AIR METAL", "Live ADS-B flight sim", "airmetal", "/opt/airmetal/config.py", None),
+    ("10", "THUNDERSTRUCK", "NOAA weather radar", "thunderstruck", "/opt/thunderstruck/thunderstruck.py", check_internet),
 ]
 
 HW_STATUS_LABELS = {
