@@ -63,10 +63,15 @@ mode** (see below), where keypresses get relayed.
   of launching a subprocess locally. The menu's hardware-readiness
   column is target-aware too -- it shows *that puppet's own*
   STRINGS-reported readiness, not the local machine's.
-- **IDENTIFY PUPPETS**: a menu row (not a real installed app) that
-  broadcasts an identify command to every puppet at once, forcing each
-  one's currently-running app to show a hostname overlay -- useful for
-  matching a physical CRT to its Pi during cabling.
+- **IDENTIFY**: the menu's last row (not an app, and it ignores the
+  selected target). Broadcasts STRINGS `/identify` to every machine in
+  `PUPPETS` at once, so each shows its own big label (P1-P4, Q1-Q4 per
+  quadrant on QUAD) via [identify](https://github.com/LawtonBarnes/identify),
+  and MP's own screen shows "MP". Left/Right flips every screen to page
+  2 (hostname, IP, resolution, disk, USB) and back; BACK or Home ends it
+  everywhere and every machine's assigned app comes back. Machines the
+  broadcast missed are listed in red at the bottom of MP's screen. Ends
+  itself after 15 minutes without a keypress.
 - **Control mode**: relay live keypresses to whichever remote machine is
   targeted, so the physical remote can drive a puppet's running app
   directly (e.g. skip tracks on a remote `bebop`) without walking over

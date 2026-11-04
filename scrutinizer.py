@@ -59,7 +59,7 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
 import pygame  # noqa: E402  (must come after SDL env vars are set)
 
-VERSION = "3.2"
+VERSION = "3.3"
 
 BASE_DIR = Path(__file__).resolve().parent
 FONT_PATH = BASE_DIR / "VCR_OSD_MONO_1.001.ttf"
@@ -703,6 +703,81 @@ APPS = [
     ("10", "THUNDERSTRUCK", "NOAA weather radar", "thunderstruck", "/opt/thunderstruck/thunderstruck.py", check_internet),
 ]
 
+# IDENTIFY (2026-11-03) -- the menu's last row, after APPS. Unlike an
+# app row it ignores the selected target: it broadcasts STRINGS's
+# /identify to every PUPPETS host at once (each shows its own label via
+# /opt/identify) and turns MP's own screen into MP's label. Left/Right
+# (or Up/Down) flips page 1 (big short name) / page 2 (full info) on
+# every screen together; BACK or Home ends it everywhere. The draw code
+# below mirrors identify.py's rather than importing it (no-shared-library
+# convention). Ends itself after IDENTIFY_TIMEOUT_SECONDS without a key,
+# the same timeout STRINGS uses, so nothing is left labeled if MP walks
+# away or goes down.
+IDENTIFY_ROW = len(APPS)
+MENU_ITEM_COUNT = len(APPS) + 1
+IDENTIFY_LABEL = "IDENTIFY"
+IDENTIFY_FONT_PATH = BASE_DIR / "RobotoMono-Bold.ttf"
+IDENTIFY_TIMEOUT_SECONDS = 15 * 60
+IDENTIFY_REQUEST_TIMEOUT_SECONDS = 1.5
+IDENTIFY_INFO_REFRESH_SECONDS = 5
+IDENTIFY_COLOR_NAMES = ["orange", "green", "white"]  # STRINGS/identify.py names, parallel to COLOR_SCHEMES
+IDENTIFY_LABEL_SIZE = 350
+IDENTIFY_INFO_SAFE = 0.10
+IDENTIFY_INFO_MAX_SIZE = 72
+IDENTIFY_INFO_MIN_SIZE = 10
+IDENTIFY_INFO_LINE_GAP = 0.25
+IDENTIFY_INDENT = " " * 5
+IDENTIFY_BUILTIN_USB = {"0424:2514", "0424:7800"}  # Pi 3B+ onboard hubs + LAN7800
+IDENTIFY_BUILTIN_USB_VENDORS = {"1d6b"}  # Linux Foundation root hubs
+
+
+def get_usb_devices():
+    try:
+        out = subprocess.run(["lsusb"], capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ["LSUSB FAILED"]
+    devices = []
+    for line in out.splitlines():
+        m = re.match(r"Bus \d+ Device \d+: ID ([0-9a-f]{4}):([0-9a-f]{4})\s*(.*)", line)
+        if not m:
+            continue
+        vid, pid, name = m.groups()
+        if vid in IDENTIFY_BUILTIN_USB_VENDORS or f"{vid}:{pid}" in IDENTIFY_BUILTIN_USB:
+            continue
+        devices.append(name.strip() or f"ID {vid}:{pid}")
+    return sorted(devices)
+
+
+def identify_info_lines(fb_w, fb_h):
+    try:
+        du = psutil.disk_usage("/")
+        disk = f"{du.free / 1024 ** 3:.1f}G FREE OF {du.total / 1024 ** 3:.0f}G"
+    except OSError:
+        disk = "?"
+    usb = get_usb_devices() or ["NONE"]
+    lines = [
+        socket.gethostname(),
+        f"IP   {get_ip_address() or 'NO IP'}",
+        f"RES  {fb_w}x{fb_h}",
+        f"DISK {disk}",
+        f"USB  {usb[0]}",
+    ] + [IDENTIFY_INDENT + d for d in usb[1:]]
+    return [line.upper() for line in lines]
+
+
+def identify_wrap(lines, cols):
+    out = []
+    for line in lines:
+        while len(line) > cols:
+            cut = line.rfind(" ", len(IDENTIFY_INDENT) + 1, cols + 1)
+            if cut <= len(IDENTIFY_INDENT):
+                return None
+            out.append(line[:cut].rstrip())
+            line = IDENTIFY_INDENT + line[cut:].strip()
+        out.append(line)
+    return out
+
+
 HW_STATUS_LABELS = {
     "not_installed": "NOT INSTALLED HERE",
     "hardware_not_found": "HARDWARE NOT FOUND",
@@ -1116,6 +1191,15 @@ class HealthApp:
         self.pending_power_action = None
         self._rel_accum = {"x": 0, "y": 0}
 
+        # IDENTIFY state -- see IDENTIFY_ROW.
+        self.identify_active = False
+        self.identify_page = 1
+        self.identify_last_input = 0.0
+        self.identify_failures = {}  # PUPPETS name -> reason, for hosts the last broadcast didn't reach
+        self.identify_info = None
+        self.identify_info_at = 0.0
+        self._identify_fonts = {}
+
         # Select Target and Remote Control Help are just pages 4/5 of
         # current_page now (2026-08-17, see the comment above
         # TARGET_SELECT_PAGE_INDEX/CONTROL_PAGE_INDEX) -- no separate
@@ -1212,7 +1296,9 @@ class HealthApp:
 
     def render(self):
         canvas = pygame.Surface((FRAME_W, FRAME_H))
-        if self.current_page == SPLASH_PAGE_INDEX:
+        if self.identify_active:
+            self._build_identify_screen(canvas)
+        elif self.current_page == SPLASH_PAGE_INDEX:
             self._build_splash_page(canvas)
         elif self.current_page == CONTROL_PAGE_INDEX:
             self._build_control_mode_screen(canvas)
@@ -1497,17 +1583,28 @@ class HealthApp:
         # (2026-10-14, SKY made 8 apps -- MP's own LOCAL menu, with 4+
         # NOT INSTALLED HERE rows, no longer fit): the first app shown is
         # the earliest one that still keeps the selection on screen.
-        heights = [1 if hardware_status.get(app[3], "ready") == "ready" else 2 for app in APPS]
+        heights = [1 if hardware_status.get(app[3], "ready") == "ready" else 2 for app in APPS] + [1]  # + IDENTIFY
         first = 0
         while first < self.selected and sum(heights[first:self.selected + 1]) > end_row - start_row:
             first += 1
 
         row = start_row
-        for idx in range(first, len(APPS)):
+        for idx in range(first, MENU_ITEM_COUNT):
             if row + heights[idx] > end_row:
                 break
             selected = idx == self.selected
             text_color = BLACK if selected else PRIMARY_COLOR
+
+            if idx == IDENTIFY_ROW:
+                highlight_x, px_y = d.char_px(1, row)
+                if selected:
+                    HIGHLIGHT_GAP = 4
+                    pygame.draw.rect(canvas, PRIMARY_COLOR, (
+                        highlight_x + HIGHLIGHT_GAP, px_y - 2,
+                        (d._width - 2) * d._char_w - 2 * HIGHLIGHT_GAP, d._char_h + 2))
+                canvas.blit(d._font.render(IDENTIFY_LABEL, True, text_color), (highlight_x + d._char_w, px_y))
+                row += 1
+                continue
 
             _key, label, _desc, cmd, script_path, _hw_check = APPS[idx]
             # A remote target's own STRINGS-reported `versions` field
@@ -1680,6 +1777,105 @@ class HealthApp:
         time.sleep(2)
         self.render()
 
+    # --- IDENTIFY (see IDENTIFY_ROW) -------------------------------------
+
+    def _broadcast_identify(self, on):
+        """POSTs /identify to every PUPPETS host in parallel (an offline
+        one costs IDENTIFY_REQUEST_TIMEOUT_SECONDS once, not per host)
+        and records the ones it didn't reach."""
+        body = {"on": on}
+        if on:
+            body.update(page=self.identify_page,
+                        color=IDENTIFY_COLOR_NAMES[self.color_scheme_index])
+        data = json.dumps(body).encode()
+        failures = {}
+
+        def send(name, ip):
+            try:
+                req = urllib.request.Request(
+                    f"http://{ip}:{PUPPET_PORT}/identify", data=data,
+                    headers={"Content-Type": "application/json"}, method="POST")
+                urllib.request.urlopen(req, timeout=IDENTIFY_REQUEST_TIMEOUT_SECONDS)
+            except urllib.error.HTTPError as exc:
+                failures[name] = "NOT INSTALLED" if exc.code == 409 else f"REJECTED {exc.code}"
+            except OSError:
+                failures[name] = "UNREACHABLE"
+
+        threads = [threading.Thread(target=send, args=(name, ip), daemon=True) for name, ip in PUPPETS]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.identify_failures = failures
+
+    def start_identify(self):
+        self.identify_active = True
+        self.identify_page = 1
+        self.identify_last_input = time.time()
+        self.identify_info = None
+        self.render()  # MP's own label first, then the broadcast
+        self._broadcast_identify(True)
+        self.render()
+
+    def stop_identify(self):
+        self.identify_active = False
+        self._broadcast_identify(False)
+        self.current_page = MENU_PAGE_INDEX
+        self.render()
+
+    def _handle_identify_keycode(self, code):
+        self.identify_last_input = time.time()
+        if code in (ecodes.KEY_BACK, ecodes.KEY_HOMEPAGE, ecodes.KEY_HOME, ecodes.KEY_ESC, ecodes.KEY_Q):
+            self.stop_identify()
+            return False  # already rendered
+        if code in (ecodes.KEY_LEFT, ecodes.KEY_RIGHT, ecodes.KEY_UP, ecodes.KEY_DOWN):
+            self.identify_page = 2 if self.identify_page == 1 else 1
+            self.render()
+            self._broadcast_identify(True)
+            return True
+        return False  # OK's doubled HID events and everything else
+
+    def _identify_font(self, size):
+        if size not in self._identify_fonts:
+            self._identify_fonts[size] = pygame.font.Font(str(IDENTIFY_FONT_PATH), size)
+        return self._identify_fonts[size]
+
+    def _build_identify_screen(self, canvas):
+        canvas.fill(BLACK)
+        rect = canvas.get_rect()
+        if self.identify_page == 1:
+            surf = self._identify_font(IDENTIFY_LABEL_SIZE).render("MP", True, PRIMARY_COLOR)
+            ink = surf.get_bounding_rect()
+            canvas.blit(surf, ((rect.w - ink.w) // 2 - ink.x, (rect.h - ink.h) // 2 - ink.y))
+        else:
+            now = time.time()
+            if self.identify_info is None or now - self.identify_info_at >= IDENTIFY_INFO_REFRESH_SECONDS:
+                self.identify_info = identify_info_lines(self.fb.width, self.fb.height)
+                self.identify_info_at = now
+            box = rect.inflate(-int(rect.w * IDENTIFY_INFO_SAFE * 2), -int(rect.h * IDENTIFY_INFO_SAFE * 2))
+            size, lines = IDENTIFY_INFO_MIN_SIZE, self.identify_info
+            for candidate in range(IDENTIFY_INFO_MAX_SIZE, IDENTIFY_INFO_MIN_SIZE - 1, -1):
+                f = self._identify_font(candidate)
+                wrapped = identify_wrap(self.identify_info, box.w // f.size("M")[0])
+                if wrapped and len(wrapped) * f.get_linesize() * (1 + IDENTIFY_INFO_LINE_GAP) <= box.h:
+                    size, lines = candidate, wrapped
+                    break
+            f = self._identify_font(size)
+            step = int(f.get_linesize() * (1 + IDENTIFY_INFO_LINE_GAP))
+            block_h = step * len(lines) - int(f.get_linesize() * IDENTIFY_INFO_LINE_GAP)
+            block_w = max(f.size(line)[0] for line in lines)
+            y = box.y + (box.h - block_h) // 2
+            for line in lines:
+                canvas.blit(f.render(line, True, PRIMARY_COLOR), (box.x + (box.w - block_w) // 2, y))
+                y += step
+        if self.identify_failures:
+            # Hosts the broadcast missed, along the bottom in the
+            # dashboard font so it never reads as part of a label.
+            text = "  ".join(f"{name} {why}" for name, why in sorted(self.identify_failures.items()))
+            surf = self.display._font.render(text, True, WARNING_COLOR)
+            canvas.blit(surf, ((rect.w - surf.get_width()) // 2,
+                               rect.h - self.display._margin_y - surf.get_height()))
+
     def _current_hardware_status(self):
         """The same hardware-readiness dict the menu page renders from
         (self.hardware_status for LOCAL, the selected puppet's own
@@ -1736,6 +1932,9 @@ class HealthApp:
         if now - self._last_activation_time < MENU_ACTIVATION_DEBOUNCE_SECONDS:
             return
         self._last_activation_time = now
+        if self.selected == IDENTIFY_ROW:
+            self.start_identify()
+            return
         cmd = APPS[self.selected][3]
         hw_status = self._current_hardware_status().get(cmd, "ready")
         if hw_status != "ready":
@@ -1752,6 +1951,8 @@ class HealthApp:
             return False  # OK's second HID event after a page jump -- see CONFIRM_SWALLOW_SECONDS
         if self.power_dialog_active:
             return self.handle_power_dialog_keycode(code)
+        if self.identify_active and code != ecodes.KEY_POWER:
+            return self._handle_identify_keycode(code)
         if self.screensaver_active:
             self.screensaver_active = False
             # HOME/TARGET/Power/Q/Esc fall through to their normal global
@@ -2261,9 +2462,9 @@ class HealthApp:
         if code == ecodes.KEY_BACK:
             self.current_page = 0
         elif code == ecodes.KEY_UP:
-            self.selected = (self.selected - 1) % len(APPS)
+            self.selected = (self.selected - 1) % MENU_ITEM_COUNT
         elif code == ecodes.KEY_DOWN:
-            self.selected = (self.selected + 1) % len(APPS)
+            self.selected = (self.selected + 1) % MENU_ITEM_COUNT
         elif code in (ecodes.KEY_ENTER, ecodes.KEY_KPENTER, ecodes.BTN_LEFT, ecodes.BTN_MOUSE):
             self._activate_menu_selection()
             return False  # already rendered
@@ -2377,6 +2578,13 @@ class HealthApp:
                         self.poller.refresh()
                         last_stats_refresh = now
                         self.render()
+                elif self.identify_active:
+                    # No screensaver over IDENTIFY; it has its own timeout.
+                    if now - self.identify_last_input >= IDENTIFY_TIMEOUT_SECONDS:
+                        self.stop_identify()
+                        last_input_time = now
+                    elif self.identify_page == 2 and now - self.identify_info_at >= IDENTIFY_INFO_REFRESH_SECONDS:
+                        self.render()  # picks up a USB device plugged in mid-cabling
                 elif not self.power_dialog_active and now - last_input_time >= SCREENSAVER_IDLE_SECONDS:
                     self.screensaver_active = True
                     self.screensaver_index = 0

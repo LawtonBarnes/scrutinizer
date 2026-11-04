@@ -30,7 +30,7 @@
 # Usage: ./sync-fleet.sh
 set -uo pipefail
 
-APP_NAMES="bars loudness bebop channel38 tvdinner joanjett weatherstar spacetruckin airmetal thunderstruck"
+APP_NAMES="bars loudness bebop channel38 tvdinner joanjett weatherstar spacetruckin airmetal thunderstruck identify"
 
 # curl needs a real IP -- SSH aliases only resolve for `ssh` itself. Every
 # host has a DHCP reservation in the Deco app; if one shows as unreachable,
