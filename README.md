@@ -67,8 +67,10 @@ mode** (see below), where keypresses get relayed.
   selected target). Broadcasts STRINGS `/identify` to every machine in
   `PUPPETS` at once, so each shows its own big label (P1-P4, Q1-Q4 per
   quadrant on QUAD) via [identify](https://github.com/LawtonBarnes/identify),
-  and MP's own screen shows "MP". Left/Right flips every screen to page
-  2 (hostname, IP, resolution, disk, USB) and back; BACK or Home ends it
+  and MP's own screen shows "MP". Right/Down steps every screen forward
+  to page 2 (hostname, IP, resolution, disk, USB) and page 3 (MOCKUP:
+  each puppet's full-screen design mockup, currently NERD-E; MP keeps
+  its label), Left/Up steps back; BACK or Home ends it
   everywhere and every machine's assigned app comes back. Machines the
   broadcast missed are listed in red at the bottom of MP's screen. Ends
   itself after 15 minutes without a keypress.

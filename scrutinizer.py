@@ -59,7 +59,7 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
 import pygame  # noqa: E402  (must come after SDL env vars are set)
 
-VERSION = "3.3"
+VERSION = "3.4"
 
 BASE_DIR = Path(__file__).resolve().parent
 FONT_PATH = BASE_DIR / "VCR_OSD_MONO_1.001.ttf"
@@ -706,14 +706,17 @@ APPS = [
 # IDENTIFY (2026-11-03) -- the menu's last row, after APPS. Unlike an
 # app row it ignores the selected target: it broadcasts STRINGS's
 # /identify to every PUPPETS host at once (each shows its own label via
-# /opt/identify) and turns MP's own screen into MP's label. Left/Right
-# (or Up/Down) flips page 1 (big short name) / page 2 (full info) on
-# every screen together; BACK or Home ends it everywhere. The draw code
+# /opt/identify) and turns MP's own screen into MP's label. Right/Down
+# steps forward and Left/Up back through page 1 (big short name), page 2
+# (full info) and page 3 (MOCKUP: each puppet's full-screen design mockup
+# from /opt/identify/mockups; MP just keeps its label) on every screen
+# together; BACK or Home ends it everywhere. The draw code
 # below mirrors identify.py's rather than importing it (no-shared-library
 # convention). Ends itself after IDENTIFY_TIMEOUT_SECONDS without a key,
 # the same timeout STRINGS uses, so nothing is left labeled if MP walks
 # away or goes down.
 IDENTIFY_ROW = len(APPS)
+IDENTIFY_PAGE_COUNT = 3
 MENU_ITEM_COUNT = len(APPS) + 1
 IDENTIFY_LABEL = "IDENTIFY"
 IDENTIFY_FONT_PATH = BASE_DIR / "RobotoMono-Bold.ttf"
@@ -1829,7 +1832,8 @@ class HealthApp:
             self.stop_identify()
             return False  # already rendered
         if code in (ecodes.KEY_LEFT, ecodes.KEY_RIGHT, ecodes.KEY_UP, ecodes.KEY_DOWN):
-            self.identify_page = 2 if self.identify_page == 1 else 1
+            step = -1 if code in (ecodes.KEY_LEFT, ecodes.KEY_UP) else 1
+            self.identify_page = (self.identify_page - 1 + step) % IDENTIFY_PAGE_COUNT + 1
             self.render()
             self._broadcast_identify(True)
             return True
@@ -1843,7 +1847,7 @@ class HealthApp:
     def _build_identify_screen(self, canvas):
         canvas.fill(BLACK)
         rect = canvas.get_rect()
-        if self.identify_page == 1:
+        if self.identify_page in (1, 3):  # MP has no mockup of its own on page 3
             surf = self._identify_font(IDENTIFY_LABEL_SIZE).render("MP", True, PRIMARY_COLOR)
             ink = surf.get_bounding_rect()
             canvas.blit(surf, ((rect.w - ink.w) // 2 - ink.x, (rect.h - ink.h) // 2 - ink.y))
