@@ -607,6 +607,7 @@ class RemotePoller:
 
 LOUDNESS_SETTINGS_PATH = "/opt/loudness/settings.ini"
 LOUDNESS_DEVICE_RE = re.compile(r"^device\s*=\s*plughw:(\d+),(\d+)", re.MULTILINE)
+LOUDNESS_NET_DEVICE_RE = re.compile(r"^device\s*=\s*net:", re.MULTILINE)
 
 
 def check_sdr_dongle():
@@ -641,6 +642,10 @@ def check_loudness_mic():
         text = Path(LOUDNESS_SETTINGS_PATH).read_text()
     except OSError:
         return False
+    if LOUDNESS_NET_DEVICE_RE.search(text):
+        # device = net:mp -- the shared gooseneck on MP, streamed by
+        # loudness's micserver.py; no local mic needed (2026-11-07).
+        return True
     match = LOUDNESS_DEVICE_RE.search(text)
     if not match:
         return False
