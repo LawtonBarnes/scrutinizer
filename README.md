@@ -1,5 +1,7 @@
 # CENTRAL SCRUTINIZER (`scrutinizer`)
 
+> **Fleet-only:** the fleet's control screen. The Pis' IP addresses are listed in `scrutinizer.py` (`PUPPETS`) and `sync-fleet.sh`; edit them for your own network.
+
 The control-and-monitoring hub for a [McBrain](https://github.com/LawtonBarnes/mcbrain)
 Raspberry Pi fleet -- an MS-DOS/OpenVMS monitor-style amber-phosphor
 dashboard for the local machine, plus live remote monitoring, app
