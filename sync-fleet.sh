@@ -4,7 +4,7 @@
 # that's what left every puppet's git state stale and blocked `git pull`
 # until the 2026-09-22 cleanup (see project_mcbrain).
 #
-# For MP and every STRINGS puppet (P1-P4 + QUAD): `git pull
+# For MP and every STRINGS puppet (P1-P4 + QUAD + HIDEF): `git pull
 # --ff-only` every app repo installed under /opt (plus STRINGS itself on
 # puppets), then restart only what actually needs it:
 #   - puppets: the currently assigned app, via STRINGS's /restart, only if
@@ -41,8 +41,9 @@ declare -A PUPPET_IPS=(
     [p3]=192.168.68.65
     [p4]=192.168.68.70
     [quad]=192.168.68.71
+    [hidef]=192.168.68.59
 )
-PUPPETS="p1 p2 p3 p4 quad"
+PUPPETS="p1 p2 p3 p4 quad hidef"
 
 # Bail early rather than fail host by host: without the aliases, ssh -G
 # just echoes the bare name back as the hostname.

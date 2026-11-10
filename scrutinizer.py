@@ -176,6 +176,9 @@ PUPPETS = [
     # RemotePoller/assign_to_puppet/_send_relay_key are all already
     # fully generic over PUPPETS.
     ("QUAD", "192.168.68.71"),
+    # HIDEF (2026-11-09): Pi 5 on the Samsung TX-T3092WH HD CRT, its
+    # own rolling cart. A regular puppet, like QUAD.
+    ("HIDEF", "192.168.68.59"),
 ]
 MONITOR_TARGETS = ["LOCAL"] + [name for name, _ip in PUPPETS]
 PUPPET_PORT = 8420
@@ -2372,7 +2375,7 @@ class HealthApp:
 
     def _build_target_select_screen(self, canvas):
         """TARGET/hamburger overlay (2026-08-16) -- a flat picker over
-        MONITOR_TARGETS (LOCAL/P1-P4/QUAD), styled like the app
+        MONITOR_TARGETS (LOCAL/P1-P4/QUAD/HIDEF), styled like the app
         menu's box but simpler: one row per machine, no version/hardware
         columns, since machines don't have those the way apps do.
         Selecting a row hands off to _handle_target_select_keycode."""
