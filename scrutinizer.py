@@ -59,7 +59,7 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
 import pygame  # noqa: E402  (must come after SDL env vars are set)
 
-VERSION = "3.6"
+VERSION = "3.7"
 
 BASE_DIR = Path(__file__).resolve().parent
 FONT_PATH = BASE_DIR / "VCR_OSD_MONO_1.001.ttf"
@@ -709,6 +709,11 @@ APPS = [
     # local hardware to check.
     ("9", "AIR METAL", "Live ADS-B flight sim", "airmetal", "/opt/airmetal/config.py", None),
     ("10", "THUNDERSTRUCK", "NOAA weather radar", "thunderstruck", "/opt/thunderstruck/thunderstruck.py", check_internet),
+    # common.py for the VERSION scan (player.py does `VERSION =
+    # common.VERSION`). Plays from each screen's local cache, so nothing
+    # to hardware-check. Private repo: deployed by its own deploy.sh, not
+    # sync-fleet.sh.
+    ("11", "SPORTATORIUM", "Ole Miss highlight wall", "sportatorium", "/opt/sportatorium/common.py", None),
 ]
 
 # IDENTIFY (2026-11-03) -- the menu's last row, after APPS. Unlike an
