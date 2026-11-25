@@ -62,7 +62,12 @@ for h in mp $PUPPETS; do
 done
 
 DRIFT=0
-PY=$(command -v python3 || command -v python)
+# The first python that actually runs -- on Windows, `python3` can be the
+# Microsoft Store stub, which exists but only prints an install hint.
+PY=""
+for c in python3 python; do
+    if "$c" -c "" 2>/dev/null; then PY=$(command -v "$c"); break; fi
+done
 
 # Returns 0 if the repo was updated, 2 if unchanged, 1 if it isn't a git
 # repo, 3 on drift (dirty/diverged/pull failed -- reported, not touched).
@@ -140,7 +145,10 @@ for p in $PUPPETS; do
         continue
     fi
     current_app=$(echo "$status" | "$PY" -c "import sys,json; print(json.load(sys.stdin).get('app') or '')" 2>/dev/null)
-    current_repo="${APP_REPO[$current_app]:-$current_app}"
+    current_repo="$current_app"
+    if [ -n "$current_app" ] && [ -n "${APP_REPO[$current_app]+x}" ]; then
+        current_repo="${APP_REPO[$current_app]}"
+    fi
 
     sync_repo "$p" /opt/strings
     strings_changed=$?
