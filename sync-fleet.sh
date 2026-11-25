@@ -32,6 +32,12 @@ set -uo pipefail
 
 APP_NAMES="bars loudness bebop channel38 tvdinner joanjett weatherstar spacetruckin airmetal thunderstruck identify"
 
+# Apps that live in another app's repo: assigned app -> its /opt repo. A
+# pull of that repo restarts the app too.
+declare -A APP_REPO=(
+    [exitrow]=airmetal
+)
+
 # curl needs a real IP -- SSH aliases only resolve for `ssh` itself. Every
 # host has a DHCP reservation in the Deco app; if one shows as unreachable,
 # re-check its IP there.
@@ -134,13 +140,14 @@ for p in $PUPPETS; do
         continue
     fi
     current_app=$(echo "$status" | "$PY" -c "import sys,json; print(json.load(sys.stdin).get('app') or '')" 2>/dev/null)
+    current_repo="${APP_REPO[$current_app]:-$current_app}"
 
     sync_repo "$p" /opt/strings
     strings_changed=$?
     app_changed=false
     for app in $(installed_apps_on "$p"); do
         sync_repo "$p" "/opt/$app"
-        if [ $? -eq 0 ] && [ "$app" = "$current_app" ]; then
+        if [ $? -eq 0 ] && [ "$app" = "$current_repo" ]; then
             app_changed=true
         fi
     done

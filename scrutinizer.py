@@ -59,7 +59,7 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
 import pygame  # noqa: E402  (must come after SDL env vars are set)
 
-VERSION = "3.7"
+VERSION = "3.8"
 
 BASE_DIR = Path(__file__).resolve().parent
 FONT_PATH = BASE_DIR / "VCR_OSD_MONO_1.001.ttf"
@@ -714,6 +714,9 @@ APPS = [
     # to hardware-check. Private repo: deployed by its own deploy.sh, not
     # sync-fleet.sh.
     ("11", "SPORTATORIUM", "Ole Miss highlight wall", "sportatorium", "/opt/sportatorium/common.py", None),
+    # AIR METAL's side windows, on P1 (port) and P3 (starboard). Lives in
+    # the airmetal repo (/opt/airmetal), VERSION literal in exitrow.py.
+    ("12", "EXITROW", "AIR METAL side windows", "exitrow", "/opt/airmetal/exitrow.py", None),
 ]
 
 # IDENTIFY (2026-11-03) -- the menu's last row, after APPS. Unlike an
