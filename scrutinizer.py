@@ -183,6 +183,14 @@ PUPPETS = [
 MONITOR_TARGETS = ["LOCAL"] + [name for name, _ip in PUPPETS]
 PUPPET_PORT = 8420
 
+# Apps that bring companions along (2026-11-28): assigning AIR METAL to
+# QUAD also puts EXITROW on P1 (port) and P3 (starboard), the side
+# windows level with the wall. A companion already running its app is
+# left alone (a re-assign would restart it).
+COMPANIONS = {
+    ("QUAD", "airmetal"): [("P1", "exitrow"), ("P3", "exitrow")],
+}
+
 # Keycodes forwarded live to a puppet's running app in control mode (see
 # assign_to_puppet()) -- must match STRINGS's RELAY_KEYS allowlist by
 # name exactly. Deliberately excludes Home/Q/Esc/Compose, which stay
@@ -1777,6 +1785,9 @@ class HealthApp:
 
         if ok:
             self.remote_poller.set_app_hint(target, cmd)
+            companions = COMPANIONS.get((target, cmd))
+            if companions:
+                threading.Thread(target=self._assign_companions, args=(companions,), daemon=True).start()
             self.current_page = CONTROL_PAGE_INDEX
             self.control_mode_last_result = None
             self.render()
@@ -1795,6 +1806,24 @@ class HealthApp:
 
         time.sleep(2)
         self.render()
+
+    def _assign_companions(self, companions):
+        """COMPANIONS: assigns each (puppet, app) unless it's already
+        running it. On its own thread, so an offline puppet's timeout
+        doesn't hold up control mode; failures are just logged."""
+        for target, app in companions:
+            ip = dict(PUPPETS)[target]
+            base = f"http://{ip}:{PUPPET_PORT}"
+            try:
+                with urllib.request.urlopen(f"{base}/status", timeout=2) as resp:
+                    if json.loads(resp.read()).get("app") == app:
+                        continue
+                req = urllib.request.Request(f"{base}/assign", data=json.dumps({"app": app}).encode(),
+                                             headers={"Content-Type": "application/json"}, method="POST")
+                urllib.request.urlopen(req, timeout=2)
+                self.remote_poller.set_app_hint(target, app)
+            except (OSError, ValueError) as exc:
+                print(f"companion {target} -> {app} failed: {exc}", file=sys.stderr)
 
     # --- IDENTIFY (see IDENTIFY_ROW) -------------------------------------
 

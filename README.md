@@ -86,7 +86,9 @@ mode** (see below), where keypresses get relayed.
 ## Sibling apps launched/assigned from the menu
 
 Each is its own repo -- paths and launcher commands come from the
-`APPS` table at the top of `scrutinizer.py`:
+`APPS` table at the top of `scrutinizer.py`. Some bring companions
+(`COMPANIONS`): assigning AIR METAL to QUAD also assigns EXITROW to P1
+and P3, unless they're already running it.
 
 - [BARS](https://github.com/LawtonBarnes/bars) -- NTSC/SMPTE test patterns
 - [LOUDNESS](https://github.com/LawtonBarnes/loudness) -- audio spectrum visualizer
